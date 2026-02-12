@@ -125,6 +125,48 @@ python -m src.eval_replay --path ./runs/session-001.jsonl
 python -m src.eval_replay --path ./runs/session-001.jsonl --json
 ```
 
+## 训练与数据扩充
+
+新增训练入口：`python -m src.train`，支持：
+
+1. 从图片目录收集样本
+2. 从视频目录按间隔抽帧
+3. 按 YOLO 标签自动对齐并划分 train/val
+4. 直接调用 Ultralytics 继续训练
+
+### 1) 仅准备数据（抽帧 + 划分，不训练）
+
+```bash
+python -m src.train \
+  --images-dir ./data/images \
+  --videos-dir ./data/videos \
+  --labels-dir ./data/labels \
+  --dataset-dir ./datasets/soccer_train \
+  --sample-every 30 \
+  --prepare-only
+```
+
+### 2) 直接训练
+
+```bash
+python -m src.train \
+  --images-dir ./data/images \
+  --videos-dir ./data/videos \
+  --labels-dir ./data/labels \
+  --dataset-dir ./datasets/soccer_train \
+  --model ./models/yolo-v8-football-players-best.pt \
+  --epochs 80 \
+  --imgsz 960 \
+  --batch 8 \
+  --device auto
+```
+
+说明：
+
+- 标签格式需为 YOLO txt（每张图一个同名 `.txt`）。
+- 默认类别：`ball,goalkeeper,player,referee`，可用 `--class-names` 或 `--classes-file` 覆盖。
+- 默认 `copy-mode=symlink`（节省磁盘空间），可切换 `--copy-mode copy`。
+
 ## 关键参数
 
 - `--detector`: `heuristic | yolo`
