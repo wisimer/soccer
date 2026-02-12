@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from .pipeline import StreamProcessor
+from .runtime import (
+    RuntimeSettings,
+    build_decode_config,
+    build_detector,
+    build_postprocessor,
+    build_projector,
+    build_recorder,
+    build_tracker,
+)
+
+
+class ConnectionHub:
+    def __init__(self) -> None:
+        self._clients: set[WebSocket] = set()
+        self._lock = asyncio.Lock()
+
+    async def connect(self, ws: WebSocket) -> None:
+        await ws.accept()
+        async with self._lock:
+            self._clients.add(ws)
+
+    async def disconnect(self, ws: WebSocket) -> None:
+        async with self._lock:
+            self._clients.discard(ws)
+
+    async def broadcast(self, payload: dict[str, Any]) -> None:
+        async with self._lock:
+            clients = list(self._clients)
+
+        stale: list[WebSocket] = []
+        for ws in clients:
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                stale.append(ws)
+
+        if stale:
+            async with self._lock:
+                for ws in stale:
+                    self._clients.discard(ws)
+
+    async def size(self) -> int:
+        async with self._lock:
+            return len(self._clients)
+
+
+async def _forward_loop(queue: asyncio.Queue[dict[str, Any]], hub: ConnectionHub) -> None:
+    while True:
+        payload = await queue.get()
+        await hub.broadcast(payload)
+
+
+def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSettings) -> FastAPI:
+    base_dir = Path(__file__).resolve().parents[1]
+    web_dir = base_dir / "web"
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=5)
+        hub = ConnectionHub()
+
+        detector = build_detector(runtime_settings)
+        tracker = build_tracker(runtime_settings)
+        projector = build_projector(runtime_settings)
+        decode_config = build_decode_config(runtime_settings)
+        postprocessor = build_postprocessor(runtime_settings)
+        recorder = build_recorder(runtime_settings)
+
+        processor = StreamProcessor(
+            source=video_source,
+            target_fps=target_fps,
+            detector=detector,
+            tracker=tracker,
+            projector=projector,
+            decode_config=decode_config,
+            postprocessor=postprocessor,
+            recorder=recorder,
+            prefer_latest_frame=runtime_settings.prefer_latest_frame,
+        )
+
+        producer_task = asyncio.create_task(processor.run(queue), name="stream-processor")
+        forward_task = asyncio.create_task(_forward_loop(queue, hub), name="ws-forwarder")
+
+        app.state.queue = queue
+        app.state.hub = hub
+        app.state.processor = processor
+        app.state.runtime = {
+            "detector": getattr(detector, "name", detector.__class__.__name__),
+            "tracker": getattr(tracker, "name", tracker.__class__.__name__),
+            "projector": getattr(projector, "name", projector.__class__.__name__),
+            "calibration_path": runtime_settings.calibration_path,
+            "decode_backend": runtime_settings.decode_backend,
+            "decode_buffer_size": runtime_settings.decode_buffer_size,
+            "decode_drop_policy": runtime_settings.decode_drop_policy,
+            "prefer_latest_frame": runtime_settings.prefer_latest_frame,
+            "smooth_alpha": runtime_settings.smooth_alpha,
+            "reid_ttl_ms": runtime_settings.reid_ttl_ms,
+            "reid_distance_px": runtime_settings.reid_distance_px,
+            "record_path": runtime_settings.record_path,
+        }
+
+        try:
+            yield
+        finally:
+            processor.stop()
+            producer_task.cancel()
+            forward_task.cancel()
+            await asyncio.gather(producer_task, forward_task, return_exceptions=True)
+
+    app = FastAPI(title="football-mvp", lifespan=lifespan)
+    app.mount("/static", StaticFiles(directory=web_dir), name="static")
+
+    @app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(web_dir / "index.html")
+
+    @app.get("/api/health")
+    async def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "video_source": video_source,
+            "target_fps": target_fps,
+            "runtime": app.state.runtime,
+            "clients": await app.state.hub.size(),
+        }
+
+    @app.websocket("/ws")
+    async def ws_endpoint(ws: WebSocket) -> None:
+        hub: ConnectionHub = app.state.hub
+        await hub.connect(ws)
+        try:
+            while True:
+                # Keep the connection alive and detect client disconnect.
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            await hub.disconnect(ws)
+
+    return app
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Football stream MVP server")
+    parser.add_argument(
+        "--source",
+        default=os.getenv("MVP_VIDEO_SOURCE", "0"),
+        help="RTSP/HLS URL, video file path, or camera index (default: 0)",
+    )
+    parser.add_argument("--fps", type=int, default=15, help="Processing FPS")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+
+    parser.add_argument(
+        "--detector",
+        choices=["heuristic", "yolo"],
+        default=os.getenv("MVP_DETECTOR", "heuristic"),
+        help="Detector backend",
+    )
+    parser.add_argument(
+        "--tracker",
+        choices=["nearest", "bytetrack"],
+        default=os.getenv("MVP_TRACKER", "nearest"),
+        help="Tracker backend",
+    )
+    parser.add_argument(
+        "--calibration",
+        default=os.getenv("MVP_CALIBRATION"),
+        help="Path to homography calibration JSON",
+    )
+    parser.add_argument("--yolo-model", default=os.getenv("MVP_YOLO_MODEL", "yolov8n.pt"))
+    parser.add_argument("--yolo-device", default=os.getenv("MVP_YOLO_DEVICE", "cpu"))
+    parser.add_argument("--yolo-conf", type=float, default=float(os.getenv("MVP_YOLO_CONF", "0.25")))
+    parser.add_argument("--yolo-imgsz", type=int, default=int(os.getenv("MVP_YOLO_IMGSZ", "1280")))
+    parser.add_argument("--track-buffer", type=int, default=int(os.getenv("MVP_TRACK_BUFFER", "30")))
+    parser.add_argument(
+        "--decode-backend",
+        choices=["opencv", "pyav"],
+        default=os.getenv("MVP_DECODE_BACKEND", "opencv"),
+    )
+    parser.add_argument(
+        "--decode-buffer-size",
+        type=int,
+        default=int(os.getenv("MVP_DECODE_BUFFER_SIZE", "8")),
+        help="Decoder frame buffer size",
+    )
+    parser.add_argument(
+        "--decode-drop-policy",
+        choices=["drop_oldest", "drop_newest"],
+        default=os.getenv("MVP_DECODE_DROP_POLICY", "drop_oldest"),
+        help="Buffer full strategy",
+    )
+    parser.add_argument(
+        "--prefer-latest-frame",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("MVP_PREFER_LATEST_FRAME", "true").lower() in ("1", "true", "yes"),
+        help="Prefer newest frame to reduce latency",
+    )
+    parser.add_argument(
+        "--smooth-alpha",
+        type=float,
+        default=float(os.getenv("MVP_SMOOTH_ALPHA", "0.35")),
+        help="EMA smoothing alpha [0,1]",
+    )
+    parser.add_argument(
+        "--reid-ttl-ms",
+        type=int,
+        default=int(os.getenv("MVP_REID_TTL_MS", "1500")),
+        help="Short-term re-identification TTL in milliseconds",
+    )
+    parser.add_argument(
+        "--reid-distance-px",
+        type=float,
+        default=float(os.getenv("MVP_REID_DISTANCE_PX", "85.0")),
+        help="Max pixel distance for short-term re-identification",
+    )
+    parser.add_argument(
+        "--record-path",
+        default=os.getenv("MVP_RECORD_PATH"),
+        help="Optional JSONL output path for payload recording",
+    )
+    parser.add_argument("--log-level", default=os.getenv("MVP_LOG_LEVEL", "info"))
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    level = getattr(logging, str(args.log_level).upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    runtime_settings = RuntimeSettings(
+        detector_backend=args.detector,
+        tracker_backend=args.tracker,
+        calibration_path=args.calibration,
+        yolo_model=args.yolo_model,
+        yolo_device=args.yolo_device,
+        yolo_conf=args.yolo_conf,
+        yolo_imgsz=args.yolo_imgsz,
+        track_buffer=args.track_buffer,
+        decode_backend=args.decode_backend,
+        decode_buffer_size=args.decode_buffer_size,
+        decode_drop_policy=args.decode_drop_policy,
+        prefer_latest_frame=args.prefer_latest_frame,
+        smooth_alpha=args.smooth_alpha,
+        reid_ttl_ms=args.reid_ttl_ms,
+        reid_distance_px=args.reid_distance_px,
+        record_path=args.record_path,
+    )
+    app = create_app(
+        video_source=str(args.source),
+        target_fps=int(args.fps),
+        runtime_settings=runtime_settings,
+    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level=str(args.log_level).lower())
+
+
+if __name__ == "__main__":
+    main()

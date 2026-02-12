@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Football MVP 2D Replay</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="header">
+        <h1>Football Stream MVP</h1>
+        <p>实时接收坐标并在 2D 球场上还原位置。</p>
+        <div id="status" class="status">Connecting...</div>
+      </section>
+
+      <section class="pitch-wrap">
+        <canvas id="pitch" width="1050" height="680"></canvas>
+      </section>
+
+      <section class="meta" id="meta">
+        <span>seq: -</span>
+        <span>entities: -</span>
+        <span>latency: - ms</span>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
