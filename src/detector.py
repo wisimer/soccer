@@ -178,6 +178,7 @@ class YoloDetector:
         device: str = "cpu",
         confidence_threshold: float = 0.25,
         image_size: int = 1280,
+        use_half: bool = False,
     ) -> None:
         try:
             from ultralytics import YOLO
@@ -190,6 +191,12 @@ class YoloDetector:
         self.device = device
         self.confidence_threshold = confidence_threshold
         self.image_size = image_size
+        self.use_half = bool(use_half) and str(device).lower().startswith("cuda")
+        raw_names = getattr(self.model.model, "names", {}) or {}
+        if isinstance(raw_names, dict):
+            self.class_names: dict[int, str] = {int(k): str(v) for k, v in raw_names.items()}
+        else:
+            self.class_names = {i: str(name) for i, name in enumerate(list(raw_names))}
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         result = self.model.predict(
@@ -197,6 +204,7 @@ class YoloDetector:
             conf=self.confidence_threshold,
             imgsz=self.image_size,
             device=self.device,
+            half=self.use_half,
             verbose=False,
         )[0]
 
@@ -211,11 +219,8 @@ class YoloDetector:
         frame_h, frame_w = frame.shape[:2]
 
         for box, score, cls_id in zip(xyxy, conf, cls):
-            kind: str | None = None
-            if cls_id == 0:
-                kind = "player"
-            elif cls_id == 32:
-                kind = "ball"
+            class_name = self.class_names.get(cls_id, "")
+            kind = self._resolve_kind(cls_id, class_name)
             if kind is None:
                 continue
 
@@ -244,3 +249,28 @@ class YoloDetector:
             )
 
         return detections
+
+    @staticmethod
+    def _resolve_kind(cls_id: int, class_name: str) -> str | None:
+        name = class_name.strip().lower()
+        if "ball" in name:
+            return "ball"
+
+        player_tokens = (
+            "person",
+            "player",
+            "goalkeeper",
+            "keeper",
+            "goalie",
+            "referee",
+            "ref",
+        )
+        if any(token in name for token in player_tokens):
+            return "player"
+
+        # Backward-compatible fallback for default COCO IDs.
+        if cls_id == 32:
+            return "ball"
+        if cls_id == 0:
+            return "player"
+        return None

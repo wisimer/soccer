@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .detector import DetectorProtocol, HeuristicDetector, YoloDetector
 from .postprocess import PostprocessConfig, TrackPostProcessor
@@ -16,14 +17,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RuntimeSettings:
+    performance_profile: str = "auto"
+    effective_profile: str = "cpu"
     detector_backend: str = "heuristic"
     tracker_backend: str = "nearest"
     calibration_path: str | None = None
     yolo_model: str = "yolov8n.pt"
     yolo_device: str = "cpu"
+    yolo_half: bool = False
     yolo_conf: float = 0.25
     yolo_imgsz: int = 1280
     track_buffer: int = 30
+    bytetrack_track_activation_threshold: float = 0.25
     decode_backend: str = "opencv"
     decode_buffer_size: int = 8
     decode_drop_policy: str = "drop_oldest"
@@ -32,6 +37,82 @@ class RuntimeSettings:
     reid_ttl_ms: int = 1500
     reid_distance_px: float = 85.0
     record_path: str | None = None
+
+
+def detect_accelerators() -> tuple[bool, bool]:
+    try:
+        import torch
+    except Exception:
+        return (False, False)
+
+    cuda = bool(torch.cuda.is_available())
+    mps = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
+    return (cuda, mps)
+
+
+def resolve_effective_profile(requested_profile: str) -> str:
+    requested = (requested_profile or "auto").strip().lower()
+    cuda_available, mps_available = detect_accelerators()
+    if requested == "custom":
+        return "custom"
+    if requested == "cpu":
+        return "cpu"
+    if requested == "nvidia":
+        if cuda_available:
+            return "nvidia"
+        if mps_available:
+            return "apple"
+        return "cpu"
+    if requested == "apple":
+        if mps_available:
+            return "apple"
+        if cuda_available:
+            return "nvidia"
+        return "cpu"
+    if cuda_available:
+        return "nvidia"
+    if mps_available:
+        return "apple"
+    return "cpu"
+
+
+def profile_defaults(profile: str) -> dict[str, Any]:
+    normalized = (profile or "cpu").strip().lower()
+    common: dict[str, Any] = {
+        "yolo_conf": 0.20,
+        "bytetrack_track_activation_threshold": 0.20,
+        "prefer_latest_frame": True,
+    }
+
+    if normalized == "nvidia":
+        common.update(
+            {
+                "yolo_device": "cuda:0",
+                "yolo_half": True,
+                "yolo_imgsz": 1280,
+                "decode_backend": "pyav",
+            }
+        )
+    elif normalized == "apple":
+        common.update(
+            {
+                "yolo_device": "mps",
+                "yolo_half": False,
+                "yolo_imgsz": 960,
+                "decode_backend": "opencv",
+            }
+        )
+    elif normalized == "cpu":
+        common.update(
+            {
+                "yolo_device": "cpu",
+                "yolo_half": False,
+                "yolo_imgsz": 640,
+                "decode_backend": "opencv",
+            }
+        )
+
+    return common
 
 
 def build_detector(settings: RuntimeSettings) -> DetectorProtocol:
@@ -43,8 +124,18 @@ def build_detector(settings: RuntimeSettings) -> DetectorProtocol:
                 device=settings.yolo_device,
                 confidence_threshold=settings.yolo_conf,
                 image_size=settings.yolo_imgsz,
+                use_half=settings.yolo_half,
             )
-            logger.info("Detector backend: yolo (%s)", settings.yolo_model)
+            logger.info(
+                "Detector backend: yolo (%s, device=%s, half=%s, conf=%s, imgsz=%s, profile=%s/%s)",
+                settings.yolo_model,
+                settings.yolo_device,
+                settings.yolo_half,
+                settings.yolo_conf,
+                settings.yolo_imgsz,
+                settings.performance_profile,
+                settings.effective_profile,
+            )
             return detector
         except Exception as exc:
             logger.warning("YOLO unavailable, fallback to heuristic detector: %s", exc)
@@ -58,7 +149,10 @@ def build_tracker(settings: RuntimeSettings) -> TrackerProtocol:
     backend = settings.tracker_backend.lower()
     if backend == "bytetrack":
         try:
-            tracker = ByteTrackAdapter(track_buffer=settings.track_buffer)
+            tracker = ByteTrackAdapter(
+                track_buffer=settings.track_buffer,
+                track_activation_threshold=settings.bytetrack_track_activation_threshold,
+            )
             logger.info("Tracker backend: bytetrack")
             return tracker
         except Exception as exc:

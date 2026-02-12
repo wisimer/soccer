@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -22,6 +22,8 @@ from .runtime import (
     build_projector,
     build_recorder,
     build_tracker,
+    profile_defaults,
+    resolve_effective_profile,
 )
 
 
@@ -66,9 +68,32 @@ async def _forward_loop(queue: asyncio.Queue[dict[str, Any]], hub: ConnectionHub
         await hub.broadcast(payload)
 
 
+def _resolve_local_video_file(video_source: str, base_dir: Path) -> Path | None:
+    source = str(video_source).strip()
+    if not source:
+        return None
+    if source.isdigit():
+        return None
+    if "://" in source:
+        return None
+
+    raw_path = Path(source).expanduser()
+    candidates = [raw_path]
+    if not raw_path.is_absolute():
+        candidates.append(base_dir / raw_path)
+        candidates.append(Path.cwd() / raw_path)
+
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
 def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSettings) -> FastAPI:
     base_dir = Path(__file__).resolve().parents[1]
     web_dir = base_dir / "web"
+    local_video_file = _resolve_local_video_file(video_source, base_dir)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -101,18 +126,27 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         app.state.hub = hub
         app.state.processor = processor
         app.state.runtime = {
+            "performance_profile": runtime_settings.performance_profile,
+            "effective_profile": runtime_settings.effective_profile,
             "detector": getattr(detector, "name", detector.__class__.__name__),
             "tracker": getattr(tracker, "name", tracker.__class__.__name__),
             "projector": getattr(projector, "name", projector.__class__.__name__),
             "calibration_path": runtime_settings.calibration_path,
+            "yolo_model": runtime_settings.yolo_model,
+            "yolo_device": runtime_settings.yolo_device,
+            "yolo_half": runtime_settings.yolo_half,
+            "yolo_conf": runtime_settings.yolo_conf,
+            "yolo_imgsz": runtime_settings.yolo_imgsz,
             "decode_backend": runtime_settings.decode_backend,
             "decode_buffer_size": runtime_settings.decode_buffer_size,
             "decode_drop_policy": runtime_settings.decode_drop_policy,
+            "bytetrack_track_activation_threshold": runtime_settings.bytetrack_track_activation_threshold,
             "prefer_latest_frame": runtime_settings.prefer_latest_frame,
             "smooth_alpha": runtime_settings.smooth_alpha,
             "reid_ttl_ms": runtime_settings.reid_ttl_ms,
             "reid_distance_px": runtime_settings.reid_distance_px,
             "record_path": runtime_settings.record_path,
+            "video_preview_url": "/api/video" if local_video_file is not None else None,
         }
 
         try:
@@ -135,10 +169,17 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         return {
             "status": "ok",
             "video_source": video_source,
+            "video_preview_url": "/api/video" if local_video_file is not None else None,
             "target_fps": target_fps,
             "runtime": app.state.runtime,
             "clients": await app.state.hub.size(),
         }
+
+    @app.get("/api/video")
+    async def video_preview() -> FileResponse:
+        if local_video_file is None:
+            raise HTTPException(status_code=404, detail="Current source is not a local video file.")
+        return FileResponse(local_video_file)
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:
@@ -148,12 +189,164 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
             while True:
                 # Keep the connection alive and detect client disconnect.
                 await ws.receive_text()
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
             await hub.disconnect(ws)
 
     return app
+
+
+def _env_bool(name: str) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _env_str(name: str) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    stripped = str(raw).strip()
+    return stripped or None
+
+
+def _resolve_bool(
+    explicit: bool | None,
+    profiled: Any,
+    env_name: str,
+    hard_default: bool,
+) -> bool:
+    if explicit is not None:
+        return bool(explicit)
+    if profiled is not None:
+        return bool(profiled)
+    env_val = _env_bool(env_name)
+    if env_val is not None:
+        return env_val
+    return hard_default
+
+
+def _resolve_float(
+    explicit: float | None,
+    profiled: Any,
+    env_name: str,
+    hard_default: float,
+) -> float:
+    if explicit is not None:
+        return float(explicit)
+    if profiled is not None:
+        return float(profiled)
+    env_val = _env_float(env_name)
+    if env_val is not None:
+        return float(env_val)
+    return hard_default
+
+
+def _resolve_int(
+    explicit: int | None,
+    profiled: Any,
+    env_name: str,
+    hard_default: int,
+) -> int:
+    if explicit is not None:
+        return int(explicit)
+    if profiled is not None:
+        return int(profiled)
+    env_val = _env_int(env_name)
+    if env_val is not None:
+        return int(env_val)
+    return hard_default
+
+
+def _resolve_str(
+    explicit: str | None,
+    profiled: Any,
+    env_name: str,
+    hard_default: str,
+) -> str:
+    if explicit is not None:
+        return str(explicit)
+    if profiled is not None:
+        return str(profiled)
+    env_val = _env_str(env_name)
+    if env_val is not None:
+        return env_val
+    return hard_default
+
+
+def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
+    requested_profile = str(args.profile or os.getenv("MVP_PROFILE", "auto")).lower()
+    effective_profile = resolve_effective_profile(requested_profile)
+    profiled = {} if effective_profile == "custom" else profile_defaults(effective_profile)
+
+    yolo_device = _resolve_str(args.yolo_device, profiled.get("yolo_device"), "MVP_YOLO_DEVICE", "cpu")
+    yolo_half = _resolve_bool(args.yolo_half, profiled.get("yolo_half"), "MVP_YOLO_HALF", False)
+    if yolo_half and not yolo_device.lower().startswith("cuda"):
+        yolo_half = False
+
+    decode_backend = _resolve_str(
+        args.decode_backend,
+        profiled.get("decode_backend"),
+        "MVP_DECODE_BACKEND",
+        "opencv",
+    ).lower()
+    if decode_backend not in ("opencv", "pyav"):
+        decode_backend = "opencv"
+
+    return RuntimeSettings(
+        performance_profile=requested_profile,
+        effective_profile=effective_profile,
+        detector_backend=args.detector,
+        tracker_backend=args.tracker,
+        calibration_path=args.calibration,
+        yolo_model=args.yolo_model,
+        yolo_device=yolo_device,
+        yolo_half=yolo_half,
+        yolo_conf=_resolve_float(args.yolo_conf, profiled.get("yolo_conf"), "MVP_YOLO_CONF", 0.25),
+        yolo_imgsz=_resolve_int(args.yolo_imgsz, profiled.get("yolo_imgsz"), "MVP_YOLO_IMGSZ", 1280),
+        track_buffer=args.track_buffer,
+        bytetrack_track_activation_threshold=_resolve_float(
+            args.bytetrack_track_activation_threshold,
+            profiled.get("bytetrack_track_activation_threshold"),
+            "MVP_BYTETRACK_TRACK_ACTIVATION_THRESHOLD",
+            0.25,
+        ),
+        decode_backend=decode_backend,
+        decode_buffer_size=args.decode_buffer_size,
+        decode_drop_policy=args.decode_drop_policy,
+        prefer_latest_frame=_resolve_bool(
+            args.prefer_latest_frame,
+            profiled.get("prefer_latest_frame"),
+            "MVP_PREFER_LATEST_FRAME",
+            True,
+        ),
+        smooth_alpha=args.smooth_alpha,
+        reid_ttl_ms=args.reid_ttl_ms,
+        reid_distance_px=args.reid_distance_px,
+        record_path=args.record_path,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,6 +360,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
 
+    parser.add_argument(
+        "--profile",
+        choices=["auto", "apple", "nvidia", "cpu", "custom"],
+        default=os.getenv("MVP_PROFILE", "auto"),
+        help="Performance profile: auto detect or force hardware-specific defaults",
+    )
     parser.add_argument(
         "--detector",
         choices=["heuristic", "yolo"],
@@ -185,14 +384,16 @@ def parse_args() -> argparse.Namespace:
         help="Path to homography calibration JSON",
     )
     parser.add_argument("--yolo-model", default=os.getenv("MVP_YOLO_MODEL", "yolov8n.pt"))
-    parser.add_argument("--yolo-device", default=os.getenv("MVP_YOLO_DEVICE", "cpu"))
-    parser.add_argument("--yolo-conf", type=float, default=float(os.getenv("MVP_YOLO_CONF", "0.25")))
-    parser.add_argument("--yolo-imgsz", type=int, default=int(os.getenv("MVP_YOLO_IMGSZ", "1280")))
+    parser.add_argument("--yolo-device", default=None)
+    parser.add_argument("--yolo-half", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--yolo-conf", type=float, default=None)
+    parser.add_argument("--yolo-imgsz", type=int, default=None)
     parser.add_argument("--track-buffer", type=int, default=int(os.getenv("MVP_TRACK_BUFFER", "30")))
+    parser.add_argument("--bytetrack-track-activation-threshold", type=float, default=None)
     parser.add_argument(
         "--decode-backend",
         choices=["opencv", "pyav"],
-        default=os.getenv("MVP_DECODE_BACKEND", "opencv"),
+        default=None,
     )
     parser.add_argument(
         "--decode-buffer-size",
@@ -209,7 +410,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prefer-latest-frame",
         action=argparse.BooleanOptionalAction,
-        default=os.getenv("MVP_PREFER_LATEST_FRAME", "true").lower() in ("1", "true", "yes"),
+        default=None,
         help="Prefer newest frame to reduce latency",
     )
     parser.add_argument(
@@ -248,24 +449,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    runtime_settings = RuntimeSettings(
-        detector_backend=args.detector,
-        tracker_backend=args.tracker,
-        calibration_path=args.calibration,
-        yolo_model=args.yolo_model,
-        yolo_device=args.yolo_device,
-        yolo_conf=args.yolo_conf,
-        yolo_imgsz=args.yolo_imgsz,
-        track_buffer=args.track_buffer,
-        decode_backend=args.decode_backend,
-        decode_buffer_size=args.decode_buffer_size,
-        decode_drop_policy=args.decode_drop_policy,
-        prefer_latest_frame=args.prefer_latest_frame,
-        smooth_alpha=args.smooth_alpha,
-        reid_ttl_ms=args.reid_ttl_ms,
-        reid_distance_px=args.reid_distance_px,
-        record_path=args.record_path,
-    )
+    runtime_settings = build_runtime_settings(args)
     app = create_app(
         video_source=str(args.source),
         target_fps=int(args.fps),

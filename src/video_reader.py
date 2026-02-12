@@ -125,6 +125,9 @@ class BufferedVideoReader:
             return
 
         frame_idx = 0
+        loop_start_wall: float | None = None
+        loop_start_source_ms: int | None = None
+        source_is_file = self._looks_like_file()
         try:
             while self._running:
                 ok, frame = capture.read()
@@ -138,6 +141,16 @@ class BufferedVideoReader:
                 frame_idx += 1
                 ts_pos = capture.get(cv2.CAP_PROP_POS_MSEC)
                 source_ts_ms = int(ts_pos) if ts_pos > 0 else None
+                if source_is_file and source_ts_ms is not None:
+                    if loop_start_source_ms is None or loop_start_wall is None or source_ts_ms < loop_start_source_ms:
+                        loop_start_source_ms = source_ts_ms
+                        loop_start_wall = time.perf_counter()
+                    else:
+                        expected_elapsed_s = max(0.0, (source_ts_ms - loop_start_source_ms) / 1000.0)
+                        actual_elapsed_s = max(0.0, time.perf_counter() - loop_start_wall)
+                        sleep_s = expected_elapsed_s - actual_elapsed_s
+                        if sleep_s > 0:
+                            time.sleep(min(sleep_s, 0.2))
                 packet = FramePacket(
                     frame=frame,
                     source_ts_ms=source_ts_ms,
@@ -166,6 +179,9 @@ class BufferedVideoReader:
         stream.thread_type = "AUTO"
 
         frame_idx = 0
+        loop_start_wall: float | None = None
+        loop_start_source_ms: int | None = None
+        source_is_file = self._looks_like_file()
         try:
             while self._running:
                 has_frame = False
@@ -176,6 +192,16 @@ class BufferedVideoReader:
                     arr = frame.to_ndarray(format="bgr24")
                     source_ts_ms = int(float(frame.time) * 1000) if frame.time is not None else None
                     frame_idx += 1
+                    if source_is_file and source_ts_ms is not None:
+                        if loop_start_source_ms is None or loop_start_wall is None or source_ts_ms < loop_start_source_ms:
+                            loop_start_source_ms = source_ts_ms
+                            loop_start_wall = time.perf_counter()
+                        else:
+                            expected_elapsed_s = max(0.0, (source_ts_ms - loop_start_source_ms) / 1000.0)
+                            actual_elapsed_s = max(0.0, time.perf_counter() - loop_start_wall)
+                            sleep_s = expected_elapsed_s - actual_elapsed_s
+                            if sleep_s > 0:
+                                time.sleep(min(sleep_s, 0.2))
                     packet = FramePacket(
                         frame=arr,
                         source_ts_ms=source_ts_ms,

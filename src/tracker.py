@@ -59,6 +59,10 @@ class NearestTracker:
                 track.last_ts_ms = ts_ms
                 track.confidence = det.confidence
                 track.team = det.team or track.team
+                track.bbox_x = float(det.x)
+                track.bbox_y = float(det.y)
+                track.bbox_w = float(det.w)
+                track.bbox_h = float(det.h)
                 track.missed_frames = 0
             else:
                 track_id = self._next_id
@@ -72,6 +76,10 @@ class NearestTracker:
                     vy_px=0.0,
                     confidence=det.confidence,
                     last_ts_ms=ts_ms,
+                    bbox_x=float(det.x),
+                    bbox_y=float(det.y),
+                    bbox_w=float(det.w),
+                    bbox_h=float(det.h),
                 )
                 new_track_ids.add(track_id)
                 self._next_id += 1
@@ -187,6 +195,10 @@ class ByteTrackAdapter:
                         confidence=conf,
                         last_ts_ms=ts_ms,
                         missed_frames=0,
+                        bbox_x=x1,
+                        bbox_y=y1,
+                        bbox_w=max(1.0, x2 - x1),
+                        bbox_h=max(1.0, y2 - y1),
                     )
                 else:
                     dt_s = max((ts_ms - prev.last_ts_ms) / 1000.0, 1e-3)
@@ -201,6 +213,10 @@ class ByteTrackAdapter:
                         confidence=conf,
                         last_ts_ms=ts_ms,
                         missed_frames=0,
+                        bbox_x=x1,
+                        bbox_y=y1,
+                        bbox_w=max(1.0, x2 - x1),
+                        bbox_h=max(1.0, y2 - y1),
                     )
 
                 self._state_by_id[track_id] = state

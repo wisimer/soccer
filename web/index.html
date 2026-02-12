@@ -3,19 +3,41 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Football MVP 2D Replay</title>
+    <title>Football MVP Replay</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <main class="layout">
       <section class="header">
         <h1>Football Stream MVP</h1>
-        <p>实时接收坐标并在 2D 球场上还原位置。</p>
+        <p>实时解码、检测与跟踪可视化（视频框选 + 球场映射）。</p>
         <div id="status" class="status">Connecting...</div>
       </section>
 
-      <section class="pitch-wrap">
-        <canvas id="pitch" width="1050" height="680"></canvas>
+      <section class="boards">
+        <article class="card">
+          <h2>视频与跟踪框</h2>
+          <div class="video-stack">
+            <video
+              id="sourceVideo"
+              class="source-video"
+              controls
+              muted
+              playsinline
+              autoplay
+              loop
+            ></video>
+            <canvas id="overlay" class="overlay-canvas"></canvas>
+            <div id="videoHint" class="video-hint">加载视频中...</div>
+          </div>
+        </article>
+
+        <article class="card">
+          <h2>2D 球场映射</h2>
+          <div class="pitch-wrap">
+            <canvas id="pitch" width="1050" height="680"></canvas>
+          </div>
+        </article>
       </section>
 
       <section class="meta" id="meta">

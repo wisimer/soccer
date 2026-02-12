@@ -77,6 +77,28 @@ python -m src.server \
   --calibration ./calibration/example_homography.json
 ```
 
+### 4) 跨平台性能预设（Apple / NVIDIA）
+
+自动识别本机加速器并应用推荐参数：
+
+```bash
+python -m src.server \
+  --source ./data/football.mp4 \
+  --detector yolo \
+  --tracker bytetrack \
+  --profile auto
+```
+
+手工指定（机器上有 NVIDIA GPU 时）：
+
+```bash
+python -m src.server \
+  --source ./data/football.mp4 \
+  --detector yolo \
+  --tracker bytetrack \
+  --profile nvidia
+```
+
 服务启动后访问：`http://127.0.0.1:8000`
 
 ## 录制与离线评估
@@ -107,9 +129,15 @@ python -m src.eval_replay --path ./runs/session-001.jsonl --json
 
 - `--detector`: `heuristic | yolo`
 - `--tracker`: `nearest | bytetrack`
+- `--profile`: `auto | apple | nvidia | cpu | custom`
+- `--yolo-device`: 例如 `cpu | mps | cuda:0`
+- `--yolo-half` / `--no-yolo-half`: 是否启用 FP16（仅 CUDA 生效）
+- `--yolo-conf`: YOLO 置信度阈值
+- `--yolo-imgsz`: YOLO 推理输入尺寸
 - `--decode-backend`: `opencv | pyav`
 - `--decode-buffer-size`: 解码缓冲区大小
 - `--decode-drop-policy`: `drop_oldest | drop_newest`
+- `--bytetrack-track-activation-threshold`: ByteTrack 激活阈值
 - `--prefer-latest-frame` / `--no-prefer-latest-frame`: 是否优先处理最新帧
 - `--smooth-alpha`: 轨迹平滑系数（0~1）
 - `--reid-ttl-ms`: 短时 ReID 保留时间
@@ -145,7 +173,7 @@ python -m src.eval_replay --path ./runs/session-001.jsonl --json
 
 ```json
 {
-  "schema_version": "1.2",
+  "schema_version": "1.3",
   "seq": 123,
   "frame_ts_ms": 1739271234567,
   "entities": [

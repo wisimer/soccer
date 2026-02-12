@@ -11,7 +11,17 @@ from .recorder import JsonlRecorder
 from .tracker import NearestTracker, TrackerProtocol
 from .video_reader import BufferedVideoReader, DecodeConfig
 
-SCHEMA_VERSION = "1.2"
+SCHEMA_VERSION = "1.3"
+
+
+def _fallback_bbox(kind: str, x_px: float, y_px: float) -> tuple[float, float, float, float]:
+    if kind == "ball":
+        size = 10.0
+        return (x_px - size / 2.0, y_px - size / 2.0, size, size)
+
+    width = 24.0
+    height = 52.0
+    return (x_px - width / 2.0, y_px - height, width, height)
 
 
 class StreamProcessor:
@@ -76,14 +86,28 @@ class StreamProcessor:
                 frame_ts_ms = packet.source_ts_ms if packet.source_ts_ms is not None else packet.capture_ts_ms
 
                 t0 = time.perf_counter()
-                detections = self.detector.detect(frame)
+                detections = await asyncio.to_thread(self.detector.detect, frame)
                 t1 = time.perf_counter()
-                raw_tracks = self.tracker.update(detections, process_ts_ms)
+                raw_tracks = await asyncio.to_thread(self.tracker.update, detections, process_ts_ms)
                 t2 = time.perf_counter()
-                tracks = self.postprocessor.update(raw_tracks, process_ts_ms)
+                tracks = await asyncio.to_thread(self.postprocessor.update, raw_tracks, process_ts_ms)
                 t3 = time.perf_counter()
 
+                detection_payload = [
+                    {
+                        "type": det.kind,
+                        "team": det.team or "unknown",
+                        "x": int(det.x),
+                        "y": int(det.y),
+                        "w": int(det.w),
+                        "h": int(det.h),
+                        "conf": round(float(det.confidence), 3),
+                    }
+                    for det in detections
+                ]
+
                 entities: list[dict[str, Any]] = []
+                track_payload: list[dict[str, Any]] = []
                 for track in tracks:
                     x_m, y_m = self.projector.to_pitch(track.x_px, track.y_px)
                     vx_m, vy_m = self.projector.velocity_to_pitch(
@@ -104,16 +128,49 @@ class StreamProcessor:
                             "conf": round(float(track.confidence), 3),
                         }
                     )
+                    if (
+                        track.bbox_x is None
+                        or track.bbox_y is None
+                        or track.bbox_w is None
+                        or track.bbox_h is None
+                    ):
+                        bbox_x, bbox_y, bbox_w, bbox_h = _fallback_bbox(track.kind, track.x_px, track.y_px)
+                    else:
+                        bbox_x = track.bbox_x
+                        bbox_y = track.bbox_y
+                        bbox_w = track.bbox_w
+                        bbox_h = track.bbox_h
+                    track_payload.append(
+                        {
+                            "id": track.track_id,
+                            "type": track.kind,
+                            "team": track.team,
+                            "x": round(float(bbox_x), 2),
+                            "y": round(float(bbox_y), 2),
+                            "w": round(float(max(1.0, bbox_w)), 2),
+                            "h": round(float(max(1.0, bbox_h)), 2),
+                            "conf": round(float(track.confidence), 3),
+                        }
+                    )
 
                 decode_stats = self.reader.stats()
                 payload = {
                     "schema_version": SCHEMA_VERSION,
                     "seq": self.seq,
                     "frame_ts_ms": frame_ts_ms,
+                    "frame": {
+                        "width": frame_width,
+                        "height": frame_height,
+                        "index": packet.frame_index,
+                        "source_ts_ms": packet.source_ts_ms,
+                        "capture_ts_ms": packet.capture_ts_ms,
+                    },
                     "pitch": {
                         "length_m": PITCH_LENGTH_M,
                         "width_m": PITCH_WIDTH_M,
                     },
+                    "detections": detection_payload,
+                    "tracks": track_payload,
                     "entities": entities,
                     "meta": {
                         "detector": getattr(self.detector, "name", self.detector.__class__.__name__),

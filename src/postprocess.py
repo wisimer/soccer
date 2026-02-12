@@ -103,6 +103,10 @@ class TrackPostProcessor:
                 vy_px=observed.vy_px,
                 confidence=observed.confidence,
                 last_ts_ms=ts_ms,
+                bbox_x=observed.bbox_x,
+                bbox_y=observed.bbox_y,
+                bbox_w=observed.bbox_w,
+                bbox_h=observed.bbox_h,
                 missed_frames=0,
             )
 
@@ -111,6 +115,10 @@ class TrackPostProcessor:
         y = alpha * observed.y_px + (1.0 - alpha) * prev.y_px
         vx = (x - prev.x_px) / dt_s
         vy = (y - prev.y_px) / dt_s
+        bbox_x = self._blend_optional(alpha, observed.bbox_x, prev.bbox_x)
+        bbox_y = self._blend_optional(alpha, observed.bbox_y, prev.bbox_y)
+        bbox_w = self._blend_optional(alpha, observed.bbox_w, prev.bbox_w)
+        bbox_h = self._blend_optional(alpha, observed.bbox_h, prev.bbox_h)
 
         return TrackState(
             track_id=stable_id,
@@ -122,8 +130,20 @@ class TrackPostProcessor:
             vy_px=vy,
             confidence=alpha * observed.confidence + (1.0 - alpha) * prev.confidence,
             last_ts_ms=ts_ms,
+            bbox_x=bbox_x,
+            bbox_y=bbox_y,
+            bbox_w=bbox_w,
+            bbox_h=bbox_h,
             missed_frames=0,
         )
+
+    @staticmethod
+    def _blend_optional(alpha: float, current: float | None, previous: float | None) -> float | None:
+        if current is None:
+            return previous
+        if previous is None:
+            return current
+        return alpha * current + (1.0 - alpha) * previous
 
     def _purge_inactive(self, ts_ms: int) -> None:
         to_remove = [

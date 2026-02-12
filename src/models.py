@@ -35,4 +35,8 @@ class TrackState:
     vy_px: float
     confidence: float
     last_ts_ms: int
+    bbox_x: float | None = None
+    bbox_y: float | None = None
+    bbox_w: float | None = None
+    bbox_h: float | None = None
     missed_frames: int = 0
