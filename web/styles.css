@@ -66,10 +66,47 @@ body {
   padding: 12px;
 }
 
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
 .card h2 {
-  margin: 0 0 10px;
+  margin: 0;
   font-size: 18px;
   color: #23301a;
+}
+
+.view-controls {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.control select {
+  border: 1px solid var(--line);
+  background: #ffffff;
+  color: var(--text);
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.control input[type="range"] {
+  width: 120px;
 }
 
 .video-stack {

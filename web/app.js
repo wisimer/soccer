@@ -11,6 +11,8 @@ const pitchCtx = pitchCanvas.getContext("2d");
 const statusEl = document.getElementById("status");
 const metaEl = document.getElementById("meta");
 const videoHintEl = document.getElementById("videoHint");
+const viewModeEl = document.getElementById("viewMode");
+const viewTiltEl = document.getElementById("viewTilt");
 
 const entities = new Map();
 let latestSeq = 0;
@@ -22,6 +24,103 @@ let latestDetections = [];
 let latestTracks = [];
 let latestFrame = { width: 0, height: 0, source_ts_ms: null, capture_ts_ms: null };
 let lastVideoSyncAt = 0;
+let pitchViewMode = viewModeEl ? viewModeEl.value : "broadcast";
+let pitchTilt = viewTiltEl ? Number(viewTiltEl.value) / 100 : 0.65;
+let pitchProjector = null;
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function lerpPoint(p, q, t) {
+  return { x: lerp(p.x, q.x, t), y: lerp(p.y, q.y, t) };
+}
+
+function projectBilinear(u, v, corners) {
+  const top = lerpPoint(corners.tl, corners.tr, u);
+  const bottom = lerpPoint(corners.bl, corners.br, u);
+  return lerpPoint(top, bottom, v);
+}
+
+function computeCorners(mode, tilt) {
+  const w = pitchCanvas.width;
+  const h = pitchCanvas.height;
+
+  if (mode === "topdown") {
+    const m = 8;
+    return {
+      tl: { x: m, y: m },
+      tr: { x: w - m, y: m },
+      bl: { x: m, y: h - m },
+      br: { x: w - m, y: h - m },
+    };
+  }
+
+  if (mode === "isometric") {
+    return {
+      tl: { x: w * 0.22, y: h * 0.18 },
+      tr: { x: w * 0.84, y: h * 0.33 },
+      bl: { x: w * 0.10, y: h * 0.78 },
+      br: { x: w * 0.72, y: h * 0.93 },
+    };
+  }
+
+  const p = clamp(tilt, 0, 1);
+  const topWidthFactor = 0.85 - 0.35 * p;
+  const topY = h * (0.10 + 0.05 * p);
+  const bottomY = h * 0.92;
+  const topHalf = (w * topWidthFactor) / 2;
+  return {
+    tl: { x: w / 2 - topHalf, y: topY },
+    tr: { x: w / 2 + topHalf, y: topY },
+    bl: { x: w * 0.04, y: bottomY },
+    br: { x: w * 0.96, y: bottomY },
+  };
+}
+
+function createPitchProjector(mode, tilt) {
+  const corners = computeCorners(mode, tilt);
+  return {
+    corners,
+    project(xMeters, yMeters) {
+      const u = clamp(xMeters / pitchLength, 0, 1);
+      const v = clamp(yMeters / pitchWidth, 0, 1);
+      const pt = projectBilinear(u, v, corners);
+      const depth = mode === "topdown" ? 1 : mode === "isometric" ? clamp((u + v) / 1.35, 0, 1) : v;
+      return { x: pt.x, y: pt.y, depth };
+    },
+  };
+}
+
+function syncViewControls() {
+  if (!viewTiltEl) {
+    return;
+  }
+  if (pitchViewMode !== "broadcast") {
+    viewTiltEl.disabled = true;
+    viewTiltEl.style.opacity = "0.5";
+  } else {
+    viewTiltEl.disabled = false;
+    viewTiltEl.style.opacity = "1";
+  }
+}
+
+if (viewModeEl) {
+  viewModeEl.addEventListener("change", () => {
+    pitchViewMode = viewModeEl.value;
+    syncViewControls();
+  });
+}
+if (viewTiltEl) {
+  viewTiltEl.addEventListener("input", () => {
+    pitchTilt = Number(viewTiltEl.value) / 100;
+  });
+}
+syncViewControls();
 
 function wsUrl() {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
@@ -229,71 +328,158 @@ function drawVideoOverlay() {
   }
 }
 
-function pitchToCanvas(x, y) {
-  return {
-    x: (x / pitchLength) * pitchCanvas.width,
-    y: (y / pitchWidth) * pitchCanvas.height,
-  };
+function drawPitchPolyline(projector, points, close) {
+  if (!points.length) {
+    return;
+  }
+  const p0 = projector.project(points[0].x, points[0].y);
+  pitchCtx.beginPath();
+  pitchCtx.moveTo(p0.x, p0.y);
+  for (let i = 1; i < points.length; i += 1) {
+    const p = projector.project(points[i].x, points[i].y);
+    pitchCtx.lineTo(p.x, p.y);
+  }
+  if (close) {
+    pitchCtx.closePath();
+  }
+  pitchCtx.stroke();
+}
+
+function drawPitchCircle(projector, cx, cy, r) {
+  const steps = 64;
+  const pts = [];
+  for (let i = 0; i <= steps; i += 1) {
+    const a = (i / steps) * Math.PI * 2;
+    pts.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
+  }
+  drawPitchPolyline(projector, pts, false);
 }
 
 function drawPitch() {
-  pitchCtx.fillStyle = "#2b8e46";
+  pitchProjector = createPitchProjector(pitchViewMode, pitchTilt);
+  const corners = pitchProjector.corners;
+
+  pitchCtx.clearRect(0, 0, pitchCanvas.width, pitchCanvas.height);
+  pitchCtx.fillStyle = "#0f1419";
   pitchCtx.fillRect(0, 0, pitchCanvas.width, pitchCanvas.height);
 
+  pitchCtx.fillStyle = "#2b8e46";
+  pitchCtx.beginPath();
+  pitchCtx.moveTo(corners.tl.x, corners.tl.y);
+  pitchCtx.lineTo(corners.tr.x, corners.tr.y);
+  pitchCtx.lineTo(corners.br.x, corners.br.y);
+  pitchCtx.lineTo(corners.bl.x, corners.bl.y);
+  pitchCtx.closePath();
+  pitchCtx.fill();
+
   pitchCtx.strokeStyle = "#ecf3d2";
-  pitchCtx.lineWidth = 4;
-  pitchCtx.strokeRect(4, 4, pitchCanvas.width - 8, pitchCanvas.height - 8);
-
+  pitchCtx.lineWidth = 3;
   pitchCtx.beginPath();
-  pitchCtx.moveTo(pitchCanvas.width / 2, 4);
-  pitchCtx.lineTo(pitchCanvas.width / 2, pitchCanvas.height - 4);
+  pitchCtx.moveTo(corners.tl.x, corners.tl.y);
+  pitchCtx.lineTo(corners.tr.x, corners.tr.y);
+  pitchCtx.lineTo(corners.br.x, corners.br.y);
+  pitchCtx.lineTo(corners.bl.x, corners.bl.y);
+  pitchCtx.closePath();
   pitchCtx.stroke();
 
-  pitchCtx.beginPath();
-  pitchCtx.arc(pitchCanvas.width / 2, pitchCanvas.height / 2, 85, 0, Math.PI * 2);
-  pitchCtx.stroke();
-
-  pitchCtx.beginPath();
-  pitchCtx.rect(4, pitchCanvas.height * 0.2, pitchCanvas.width * 0.16, pitchCanvas.height * 0.6);
-  pitchCtx.rect(
-    pitchCanvas.width * 0.84,
-    pitchCanvas.height * 0.2,
-    pitchCanvas.width * 0.16 - 4,
-    pitchCanvas.height * 0.6
+  drawPitchPolyline(
+    pitchProjector,
+    [
+      { x: pitchLength / 2, y: 0 },
+      { x: pitchLength / 2, y: pitchWidth },
+    ],
+    false
   );
-  pitchCtx.stroke();
+
+  drawPitchCircle(pitchProjector, pitchLength / 2, pitchWidth / 2, 9.15);
+
+  const penaltyDepth = 16.5;
+  const penaltyWidth = 40.32;
+  const penaltyTop = (pitchWidth - penaltyWidth) / 2;
+  const penaltyBottom = penaltyTop + penaltyWidth;
+
+  drawPitchPolyline(
+    pitchProjector,
+    [
+      { x: 0, y: penaltyTop },
+      { x: penaltyDepth, y: penaltyTop },
+      { x: penaltyDepth, y: penaltyBottom },
+      { x: 0, y: penaltyBottom },
+      { x: 0, y: penaltyTop },
+    ],
+    false
+  );
+
+  drawPitchPolyline(
+    pitchProjector,
+    [
+      { x: pitchLength, y: penaltyTop },
+      { x: pitchLength - penaltyDepth, y: penaltyTop },
+      { x: pitchLength - penaltyDepth, y: penaltyBottom },
+      { x: pitchLength, y: penaltyBottom },
+      { x: pitchLength, y: penaltyTop },
+    ],
+    false
+  );
 }
 
 function drawPitchEntities() {
+  if (!pitchProjector) {
+    pitchProjector = createPitchProjector(pitchViewMode, pitchTilt);
+  }
   const now = performance.now();
+
+  const drawable = [];
   for (const e of entities.values()) {
     e.x += (e.targetX - e.x) * 0.25;
     e.y += (e.targetY - e.y) * 0.25;
-
-    const p = pitchToCanvas(e.x, e.y);
-    if (e.type === "ball") {
-      pitchCtx.fillStyle = "#ffffff";
-      pitchCtx.beginPath();
-      pitchCtx.arc(p.x, p.y, 7, 0, Math.PI * 2);
-      pitchCtx.fill();
-      pitchCtx.strokeStyle = "#111111";
-      pitchCtx.lineWidth = 1;
-      pitchCtx.stroke();
-    } else {
-      pitchCtx.fillStyle = e.team === "A" ? "#e04a3f" : e.team === "B" ? "#1f5abf" : "#111111";
-      pitchCtx.beginPath();
-      pitchCtx.arc(p.x, p.y, 10, 0, Math.PI * 2);
-      pitchCtx.fill();
-
-      pitchCtx.fillStyle = "#f8f8f8";
-      pitchCtx.font = "11px sans-serif";
-      pitchCtx.textAlign = "center";
-      pitchCtx.fillText(String(e.id), p.x, p.y - 14);
-    }
+    const p = pitchProjector.project(e.x, e.y);
+    drawable.push({ e, p });
 
     if (now - e.updatedAt > 1800) {
       entities.delete(e.id);
     }
+  }
+
+  drawable.sort((a, b) => a.p.y - b.p.y);
+
+  for (const item of drawable) {
+    const e = item.e;
+    const p = item.p;
+    const scale = pitchViewMode === "topdown" ? 1 : 0.55 + 0.95 * p.depth;
+
+    if (e.type === "ball") {
+      const r = 5.5 * scale;
+      pitchCtx.fillStyle = "rgba(0, 0, 0, 0.18)";
+      pitchCtx.beginPath();
+      pitchCtx.ellipse(p.x, p.y + r * 0.9, r * 1.05, r * 0.55, 0, 0, Math.PI * 2);
+      pitchCtx.fill();
+
+      pitchCtx.fillStyle = "#ffffff";
+      pitchCtx.beginPath();
+      pitchCtx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      pitchCtx.fill();
+      pitchCtx.strokeStyle = "#111111";
+      pitchCtx.lineWidth = 1;
+      pitchCtx.stroke();
+      continue;
+    }
+
+    const r = 8.5 * scale;
+    pitchCtx.fillStyle = "rgba(0, 0, 0, 0.22)";
+    pitchCtx.beginPath();
+    pitchCtx.ellipse(p.x, p.y + r * 0.9, r * 1.05, r * 0.55, 0, 0, Math.PI * 2);
+    pitchCtx.fill();
+
+    pitchCtx.fillStyle = e.team === "A" ? "#e04a3f" : e.team === "B" ? "#1f5abf" : "#111111";
+    pitchCtx.beginPath();
+    pitchCtx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    pitchCtx.fill();
+
+    pitchCtx.fillStyle = "#f8f8f8";
+    pitchCtx.font = `${Math.max(10, Math.round(11 * scale))}px sans-serif`;
+    pitchCtx.textAlign = "center";
+    pitchCtx.fillText(String(e.id), p.x, p.y - r - 3);
   }
 }
 
