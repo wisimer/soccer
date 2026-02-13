@@ -33,25 +33,12 @@
         </article>
 
         <article class="card">
-          <div class="card-head">
-            <h2>2.5D 球场映射</h2>
-            <div class="view-controls">
-              <label class="control">
-                <span>视角</span>
-                <select id="viewMode">
-                  <option value="broadcast" selected>转播</option>
-                  <option value="isometric">等距</option>
-                  <option value="topdown">俯视</option>
-                </select>
-              </label>
-              <label class="control">
-                <span>倾斜</span>
-                <input id="viewTilt" type="range" min="0" max="100" value="65" />
-              </label>
+          <h2>萌熊足球自由视角球场</h2>
+          <div class="pitch-viewport" id="pitchViewport">
+            <div class="pitch-scene" id="pitchScene">
+              <canvas id="pitch" width="1050" height="680"></canvas>
             </div>
-          </div>
-          <div class="pitch-wrap">
-            <canvas id="pitch" width="1050" height="680"></canvas>
+            <div class="pitch-help">拖拽旋转视角 · 滚轮缩放 · Shift/右键拖拽平移 · 双击重置</div>
           </div>
         </article>
       </section>

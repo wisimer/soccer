@@ -349,12 +349,23 @@ def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
     )
 
 
+def _default_video_source() -> str:
+    env_source = os.getenv("MVP_VIDEO_SOURCE")
+    if env_source:
+        return env_source
+
+    preferred = Path(__file__).resolve().parents[1] / "data" / "tNoeaxzFpf0_from_05m_exact.mp4"
+    if preferred.exists() and preferred.is_file():
+        return str(preferred)
+    return "0"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Football stream MVP server")
     parser.add_argument(
         "--source",
-        default=os.getenv("MVP_VIDEO_SOURCE", "0"),
-        help="RTSP/HLS URL, video file path, or camera index (default: 0)",
+        default=_default_video_source(),
+        help="RTSP/HLS URL, video file path, or camera index (default: local test clip if present, else 0)",
     )
     parser.add_argument("--fps", type=int, default=15, help="Processing FPS")
     parser.add_argument("--host", default="0.0.0.0")
