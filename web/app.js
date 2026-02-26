@@ -818,6 +818,87 @@ function drawPanda(entity, camera, now) {
   pitchCtx.fillText(String(entity.id), bodyX, bodyY + pandaSize * 0.02);
 }
 
+function drawMonkey(entity, camera, now) {
+  const phase = now * 0.007 + Number(entity.id || 0) * 0.61;
+  const bob = Math.sin(phase) * 0.09;
+  const base = projectWorldPoint(entity.x, 0, entity.y, camera);
+  const top = projectWorldPoint(entity.x, 1.72 + bob, entity.y, camera);
+  if (!base || !top) {
+    return;
+  }
+
+  const monkeySize = clamp((base.y - top.y) * 1.22, 14, 62);
+  const bodyX = base.x;
+  const bodyY = base.y - monkeySize * 0.75;
+  const headY = bodyY - monkeySize * 0.54;
+
+  pitchCtx.fillStyle = "rgba(23, 20, 13, 0.24)";
+  pitchCtx.beginPath();
+  pitchCtx.ellipse(base.x, base.y - monkeySize * 0.03, monkeySize * 0.54, monkeySize * 0.23, 0, 0, Math.PI * 2);
+  pitchCtx.fill();
+
+  pitchCtx.strokeStyle = "#5e3b21";
+  pitchCtx.lineWidth = Math.max(1.2, monkeySize * 0.05);
+  pitchCtx.beginPath();
+  pitchCtx.arc(bodyX + monkeySize * 0.34, bodyY - monkeySize * 0.12, monkeySize * 0.26, -0.55 * Math.PI, 0.6 * Math.PI);
+  pitchCtx.stroke();
+
+  pitchCtx.fillStyle = "#8f5f35";
+  pitchCtx.beginPath();
+  pitchCtx.ellipse(bodyX, bodyY, monkeySize * 0.4, monkeySize * 0.48, 0, 0, Math.PI * 2);
+  pitchCtx.fill();
+
+  pitchCtx.fillStyle = "#6fb9ff";
+  pitchCtx.beginPath();
+  pitchCtx.ellipse(bodyX, bodyY + monkeySize * 0.06, monkeySize * 0.35, monkeySize * 0.23, 0, 0, Math.PI * 2);
+  pitchCtx.fill();
+
+  pitchCtx.fillStyle = "#8f5f35";
+  pitchCtx.beginPath();
+  pitchCtx.arc(bodyX - monkeySize * 0.28, headY - monkeySize * 0.08, monkeySize * 0.13, 0, Math.PI * 2);
+  pitchCtx.arc(bodyX + monkeySize * 0.28, headY - monkeySize * 0.08, monkeySize * 0.13, 0, Math.PI * 2);
+  pitchCtx.fill();
+
+  pitchCtx.fillStyle = "#c99662";
+  pitchCtx.beginPath();
+  pitchCtx.arc(bodyX - monkeySize * 0.28, headY - monkeySize * 0.08, monkeySize * 0.075, 0, Math.PI * 2);
+  pitchCtx.arc(bodyX + monkeySize * 0.28, headY - monkeySize * 0.08, monkeySize * 0.075, 0, Math.PI * 2);
+  pitchCtx.fill();
+
+  pitchCtx.fillStyle = "#9a673d";
+  pitchCtx.beginPath();
+  pitchCtx.arc(bodyX, headY, monkeySize * 0.34, 0, Math.PI * 2);
+  pitchCtx.fill();
+
+  pitchCtx.fillStyle = "#d8b188";
+  pitchCtx.beginPath();
+  pitchCtx.ellipse(bodyX, headY + monkeySize * 0.02, monkeySize * 0.22, monkeySize * 0.17, 0, 0, Math.PI * 2);
+  pitchCtx.fill();
+
+  pitchCtx.fillStyle = "#1c1611";
+  pitchCtx.beginPath();
+  pitchCtx.arc(bodyX - monkeySize * 0.11, headY - monkeySize * 0.04, monkeySize * 0.035, 0, Math.PI * 2);
+  pitchCtx.arc(bodyX + monkeySize * 0.11, headY - monkeySize * 0.04, monkeySize * 0.035, 0, Math.PI * 2);
+  pitchCtx.fill();
+
+  pitchCtx.fillStyle = "#6b3f1f";
+  pitchCtx.beginPath();
+  pitchCtx.arc(bodyX, headY + monkeySize * 0.04, monkeySize * 0.03, 0, Math.PI * 2);
+  pitchCtx.fill();
+
+  pitchCtx.strokeStyle = "#6b3f1f";
+  pitchCtx.lineWidth = Math.max(1, monkeySize * 0.032);
+  pitchCtx.beginPath();
+  pitchCtx.arc(bodyX, headY + monkeySize * 0.08, monkeySize * 0.09, 0.2 * Math.PI, 0.8 * Math.PI);
+  pitchCtx.stroke();
+
+  pitchCtx.fillStyle = "#f7fbff";
+  pitchCtx.font = `${Math.max(10, monkeySize * 0.22)}px "Avenir Next", sans-serif`;
+  pitchCtx.textAlign = "center";
+  pitchCtx.textBaseline = "middle";
+  pitchCtx.fillText(String(entity.id), bodyX, bodyY + monkeySize * 0.03);
+}
+
 function drawBall(entity, camera, now) {
   const bounce = 0.16 + Math.abs(Math.sin(now * 0.01 + Number(entity.id || 0))) * 0.11;
   const center = projectWorldPoint(entity.x, 0.25 + bounce, entity.y, camera);
@@ -863,8 +944,9 @@ function drawPitchScene() {
     if (!p) {
       continue;
     }
+    const kind = entity.type === "ball" ? "ball" : entity.team === "B" ? "monkey" : "panda";
     drawables.push({
-      kind: entity.type === "ball" ? "ball" : "panda",
+      kind,
       entity,
       depth: p.depth,
     });
@@ -874,6 +956,8 @@ function drawPitchScene() {
   for (const item of drawables) {
     if (item.kind === "ball") {
       drawBall(item.entity, camera, now);
+    } else if (item.kind === "monkey") {
+      drawMonkey(item.entity, camera, now);
     } else {
       drawPanda(item.entity, camera, now);
     }

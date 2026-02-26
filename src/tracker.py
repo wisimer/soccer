@@ -30,7 +30,8 @@ class NearestTracker:
             best_track_id = None
             best_distance = float("inf")
             det_x, det_y = det.foot_point if det.kind == "player" else det.center
-            distance_gate = 90.0 if det.kind == "ball" else 70.0
+            base_gate = 90.0 if det.kind == "ball" else 70.0
+            max_extra_gate = 120.0 if det.kind == "ball" else 90.0
 
             for track_id, track in self._tracks.items():
                 if track_id in used_track_ids:
@@ -38,8 +39,15 @@ class NearestTracker:
                 if track.kind != det.kind:
                     continue
 
-                distance = float(np.hypot(det_x - track.x_px, det_y - track.y_px))
-                if distance < best_distance and distance <= distance_gate:
+                dt_s = max((ts_ms - track.last_ts_ms) / 1000.0, 1e-3)
+                pred_dt = min(dt_s, 0.25)
+                pred_x = track.x_px + track.vx_px * pred_dt
+                pred_y = track.y_px + track.vy_px * pred_dt
+                speed = float(np.hypot(track.vx_px, track.vy_px))
+                dynamic_gate = base_gate + min(max_extra_gate, speed * pred_dt * 1.2 + track.missed_frames * 14.0)
+
+                distance = float(np.hypot(det_x - pred_x, det_y - pred_y))
+                if distance < best_distance and distance <= dynamic_gate:
                     best_distance = distance
                     best_track_id = track_id
 
@@ -52,8 +60,10 @@ class NearestTracker:
             if det_idx in assignments:
                 track = self._tracks[assignments[det_idx]]
                 dt_s = max((ts_ms - track.last_ts_ms) / 1000.0, 1e-3)
-                track.vx_px = (det_x - track.x_px) / dt_s
-                track.vy_px = (det_y - track.y_px) / dt_s
+                measured_vx = (det_x - track.x_px) / dt_s
+                measured_vy = (det_y - track.y_px) / dt_s
+                track.vx_px = 0.68 * measured_vx + 0.32 * track.vx_px
+                track.vy_px = 0.68 * measured_vy + 0.32 * track.vy_px
                 track.x_px = det_x
                 track.y_px = det_y
                 track.last_ts_ms = ts_ms
