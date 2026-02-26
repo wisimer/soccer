@@ -354,7 +354,7 @@ def _default_video_source() -> str:
     if env_source:
         return env_source
 
-    preferred = Path(__file__).resolve().parents[1] / "data" / "tNoeaxzFpf0_from_05m_exact.mp4"
+    preferred = Path(__file__).resolve().parents[1] / "data" / "HBTFZwMdcCw.mp4"
     if preferred.exists() and preferred.is_file():
         return str(preferred)
     return "0"
