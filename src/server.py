@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -12,8 +13,10 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from .pipeline import StreamProcessor
+from .game_engine import GameEngine
+from .pipeline import SCHEMA_VERSION, StreamProcessor
 from .runtime import (
     RuntimeSettings,
     build_decode_config,
@@ -62,6 +65,18 @@ class ConnectionHub:
             return len(self._clients)
 
 
+class JoinGameRequest(BaseModel):
+    user_id: str | None = None
+    team: str
+
+
+class SkillActionRequest(BaseModel):
+    user_id: str
+    team: str
+    skill: str
+    client_event_id: str | None = None
+
+
 async def _forward_loop(queue: asyncio.Queue[dict[str, Any]], hub: ConnectionHub) -> None:
     while True:
         payload = await queue.get()
@@ -99,6 +114,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
     async def lifespan(app: FastAPI):
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=5)
         hub = ConnectionHub()
+        game_engine = GameEngine()
 
         detector = build_detector(runtime_settings)
         tracker = build_tracker(runtime_settings)
@@ -116,6 +132,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
             decode_config=decode_config,
             postprocessor=postprocessor,
             recorder=recorder,
+            game_engine=game_engine,
             prefer_latest_frame=runtime_settings.prefer_latest_frame,
         )
 
@@ -124,6 +141,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
 
         app.state.queue = queue
         app.state.hub = hub
+        app.state.game_engine = game_engine
         app.state.processor = processor
         app.state.runtime = {
             "performance_profile": runtime_settings.performance_profile,
@@ -147,6 +165,8 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
             "reid_distance_px": runtime_settings.reid_distance_px,
             "record_path": runtime_settings.record_path,
             "video_preview_url": "/api/video" if local_video_file is not None else None,
+            "ws_schema_version": SCHEMA_VERSION,
+            "game_mode": "realtime-command-battle",
         }
 
         try:
@@ -180,6 +200,70 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         if local_video_file is None:
             raise HTTPException(status_code=404, detail="Current source is not a local video file.")
         return FileResponse(local_video_file)
+
+    @app.post("/api/game/join")
+    async def game_join(request: JoinGameRequest) -> dict[str, Any]:
+        game_engine: GameEngine = app.state.game_engine
+        user_id = (request.user_id or f"u_{uuid.uuid4().hex[:10]}").strip()
+        team = str(request.team or "").strip().upper()
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        if team not in ("A", "B"):
+            raise HTTPException(status_code=400, detail="team must be A or B")
+
+        try:
+            join_result = game_engine.join(user_id=user_id, team=team)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "ok": True,
+            "join": join_result,
+            "state": game_engine.get_state(user_id=user_id),
+        }
+
+    @app.post("/api/game/action")
+    async def game_action(request: SkillActionRequest) -> dict[str, Any]:
+        game_engine: GameEngine = app.state.game_engine
+        user_id = str(request.user_id or "").strip()
+        team = str(request.team or "").strip().upper()
+        skill = str(request.skill or "").strip()
+        if not user_id or not skill:
+            raise HTTPException(status_code=400, detail="user_id and skill are required")
+        if team not in ("A", "B"):
+            raise HTTPException(status_code=400, detail="team must be A or B")
+
+        result = game_engine.submit_action(
+            user_id=user_id,
+            team=team,
+            skill=skill,
+            client_event_id=request.client_event_id,
+        )
+        result["state"] = game_engine.get_state(user_id=user_id)
+        return result
+
+    @app.get("/api/game/state")
+    async def game_state(user_id: str | None = None) -> dict[str, Any]:
+        game_engine: GameEngine = app.state.game_engine
+        if user_id is not None:
+            user_id = str(user_id).strip() or None
+        return game_engine.get_state(user_id=user_id)
+
+    @app.get("/api/game/result/latest")
+    async def game_result_latest() -> dict[str, Any]:
+        game_engine: GameEngine = app.state.game_engine
+        result = game_engine.get_latest_result()
+        if result is None:
+            raise HTTPException(status_code=404, detail="No round result available yet.")
+        return result
+
+    @app.get("/api/game/highlight/latest")
+    async def game_highlight_latest() -> dict[str, Any]:
+        game_engine: GameEngine = app.state.game_engine
+        highlight = game_engine.get_latest_highlight()
+        if highlight is None:
+            raise HTTPException(status_code=404, detail="No highlight available yet.")
+        return highlight
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:

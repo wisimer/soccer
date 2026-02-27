@@ -9,9 +9,98 @@
   <body>
     <main class="layout">
       <section class="header">
-        <h1>Football Stream MVP</h1>
-        <p>实时解码、检测与跟踪可视化（视频框选 + 球场映射）。</p>
-        <div id="status" class="status">Connecting...</div>
+        <h1>萌熊 vs 猴子 实时指挥战</h1>
+        <p>90 秒快局 · 事件命中触发技能 · 连击冲榜</p>
+        <div class="status-row">
+          <div id="status" class="status">Connecting...</div>
+          <div id="playerBadge" class="player-badge">未加入阵营</div>
+        </div>
+      </section>
+
+      <section class="game-layer card">
+        <div class="round-row">
+          <div class="team-score team-a">
+            <div class="team-name">萌熊</div>
+            <div class="team-points" id="scoreA">0</div>
+            <div class="team-combo" id="comboA">x1.00</div>
+          </div>
+          <div class="round-center">
+            <div id="roundPhase" class="round-phase">LOBBY</div>
+            <div id="roundRemain" class="round-remain">00.0s</div>
+          </div>
+          <div class="team-score team-b">
+            <div class="team-name">猴子</div>
+            <div class="team-points" id="scoreB">0</div>
+            <div class="team-combo" id="comboB">x1.00</div>
+          </div>
+        </div>
+
+        <div class="mascot-row">
+          <div class="mascot-card panda">
+            <div class="mascot-head">萌熊状态</div>
+            <div class="mascot-main">
+              <span id="mascotMoodA">focus</span>
+              <span id="mascotEnergyA">50</span>
+            </div>
+          </div>
+          <div class="mascot-card monkey">
+            <div class="mascot-head">猴子状态</div>
+            <div class="mascot-main">
+              <span id="mascotMoodB">focus</span>
+              <span id="mascotEnergyB">50</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="join-row">
+          <button id="joinA" class="join-btn join-a">加入萌熊</button>
+          <button id="joinB" class="join-btn join-b">加入猴子</button>
+          <div id="energyText" class="energy-text">能量 0 / 100</div>
+        </div>
+
+        <div id="skillsGrid" class="skills-grid">
+          <button class="skill-card" data-skill="BoostPass">
+            <span class="skill-name">BoostPass</span>
+            <span class="skill-meta">传导强化</span>
+            <span class="skill-cost">16</span>
+            <span class="skill-cooldown"></span>
+          </button>
+          <button class="skill-card" data-skill="StealAura">
+            <span class="skill-name">StealAura</span>
+            <span class="skill-meta">抢断气场</span>
+            <span class="skill-cost">20</span>
+            <span class="skill-cooldown"></span>
+          </button>
+          <button class="skill-card" data-skill="ShotBuff">
+            <span class="skill-name">ShotBuff</span>
+            <span class="skill-meta">射门增幅</span>
+            <span class="skill-cost">24</span>
+            <span class="skill-cooldown"></span>
+          </button>
+          <button class="skill-card" data-skill="GoalGuard">
+            <span class="skill-name">GoalGuard</span>
+            <span class="skill-meta">守门怒吼</span>
+            <span class="skill-cost">22</span>
+            <span class="skill-cooldown"></span>
+          </button>
+          <button class="skill-card" data-skill="ComboLock">
+            <span class="skill-name">ComboLock</span>
+            <span class="skill-meta">连击锁定</span>
+            <span class="skill-cost">26</span>
+            <span class="skill-cooldown"></span>
+          </button>
+          <button class="skill-card" data-skill="HypeRoar">
+            <span class="skill-name">HypeRoar</span>
+            <span class="skill-meta">全员狂热</span>
+            <span class="skill-cost">28</span>
+            <span class="skill-cooldown"></span>
+          </button>
+        </div>
+
+        <div class="event-box">
+          <div class="event-title">实时事件流</div>
+          <div id="eventFeed" class="event-feed"></div>
+        </div>
       </section>
 
       <section class="boards">
@@ -49,6 +138,16 @@
         <span>latency: - ms</span>
       </section>
     </main>
+
+    <div id="resultModal" class="result-modal hidden">
+      <div class="result-card">
+        <h3 id="resultTitle">本局结算</h3>
+        <p id="resultSubtitle">-</p>
+        <div id="resultScore" class="result-score">0 : 0</div>
+        <div id="resultMvp" class="result-mvp">MVP: -</div>
+        <button id="resultClose" class="result-close">继续观战</button>
+      </div>
+    </div>
 
     <script src="/static/app.js"></script>
   </body>

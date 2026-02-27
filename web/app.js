@@ -23,6 +23,25 @@ let latestDetections = [];
 let latestTracks = [];
 let latestFrame = { width: 0, height: 0, source_ts_ms: null, capture_ts_ms: null };
 let lastVideoSyncAt = 0;
+let lastHardSeekAt = 0;
+let videoRateUntil = 0;
+let lastOverlayRenderAt = 0;
+let lastPitchRenderAt = 0;
+
+const isMobileDevice =
+  window.matchMedia("(max-width: 900px)").matches ||
+  /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent || "");
+const videoSyncConfig = {
+  minSyncIntervalMs: isMobileDevice ? 620 : 320,
+  softDriftSec: isMobileDevice ? 0.55 : 0.35,
+  hardSeekDriftSec: isMobileDevice ? 2.2 : 1.2,
+  hardSeekCooldownMs: isMobileDevice ? 3000 : 1800,
+  rateGain: isMobileDevice ? 0.09 : 0.12,
+  maxRateDelta: isMobileDevice ? 0.06 : 0.1,
+  minRate: isMobileDevice ? 0.94 : 0.9,
+  maxRate: isMobileDevice ? 1.06 : 1.1,
+  rateHoldMs: isMobileDevice ? 900 : 600,
+};
 
 const defaultPitchCamera = Object.freeze({
   yaw: -34,
@@ -38,9 +57,296 @@ let activePitchPointer = null;
 const activeTouchPoints = new Map();
 let pinchSnapshot = null;
 
+const teamNameMap = { A: "萌熊", B: "猴子" };
+const skillLabelMap = {
+  BoostPass: "传导强化",
+  StealAura: "抢断气场",
+  ShotBuff: "射门增幅",
+  GoalGuard: "守门怒吼",
+  ComboLock: "连击锁定",
+  HypeRoar: "全员狂热",
+};
+const moodLabelMap = {
+  calm: "calm",
+  focus: "focus",
+  happy: "happy",
+  hype: "hype",
+  tense: "tense",
+  tilt: "tilt",
+};
+
+const joinAEl = document.getElementById("joinA");
+const joinBEl = document.getElementById("joinB");
+const playerBadgeEl = document.getElementById("playerBadge");
+const scoreAEl = document.getElementById("scoreA");
+const scoreBEl = document.getElementById("scoreB");
+const comboAEl = document.getElementById("comboA");
+const comboBEl = document.getElementById("comboB");
+const roundPhaseEl = document.getElementById("roundPhase");
+const roundRemainEl = document.getElementById("roundRemain");
+const mascotMoodAEl = document.getElementById("mascotMoodA");
+const mascotMoodBEl = document.getElementById("mascotMoodB");
+const mascotEnergyAEl = document.getElementById("mascotEnergyA");
+const mascotEnergyBEl = document.getElementById("mascotEnergyB");
+const energyTextEl = document.getElementById("energyText");
+const eventFeedEl = document.getElementById("eventFeed");
+const resultModalEl = document.getElementById("resultModal");
+const resultTitleEl = document.getElementById("resultTitle");
+const resultSubtitleEl = document.getElementById("resultSubtitle");
+const resultScoreEl = document.getElementById("resultScore");
+const resultMvpEl = document.getElementById("resultMvp");
+const resultCloseEl = document.getElementById("resultClose");
+const skillButtons = Array.from(document.querySelectorAll(".skill-card"));
+
+const defaultSkillCatalog = [
+  { name: "BoostPass", cooldown_ms: 3800, energy_cost: 16 },
+  { name: "StealAura", cooldown_ms: 5200, energy_cost: 20 },
+  { name: "ShotBuff", cooldown_ms: 6200, energy_cost: 24 },
+  { name: "GoalGuard", cooldown_ms: 7200, energy_cost: 22 },
+  { name: "ComboLock", cooldown_ms: 7800, energy_cost: 26 },
+  { name: "HypeRoar", cooldown_ms: 9800, energy_cost: 28 },
+];
+const skillCatalog = new Map(defaultSkillCatalog.map((item) => [item.name, item]));
+
+const seenEventIds = new Set();
+const seenSkillIds = new Set();
+const eventTimeline = [];
+let eventFeedDirty = true;
+const overlayFrameBuffer = [];
+const maxOverlayFrameBuffer = isMobileDevice ? 320 : 260;
+let overlaySyncDeltaMs = 0;
+const maxFutureOverlayLeadMs = isMobileDevice ? 80 : 120;
+
+const localUserId = (() => {
+  const key = "soccer_game_user_id";
+  try {
+    const current = window.localStorage.getItem(key);
+    if (current) {
+      return current;
+    }
+    const created = `u_${Math.random().toString(36).slice(2, 12)}`;
+    window.localStorage.setItem(key, created);
+    return created;
+  } catch (_error) {
+    return `u_${Math.random().toString(36).slice(2, 12)}`;
+  }
+})();
+
+let joinedTeam = null;
+let pendingAction = false;
+let shownResultRoundId = 0;
+const gameView = {
+  round: { id: 0, phase: "LOBBY", remain_ms: 0, started_ms: 0, duration_ms: 0 },
+  score: { team_a: 0, team_b: 0, combo_a: 1, combo_b: 1 },
+  mascot: {
+    team_a: { mood: "focus", energy: 50 },
+    team_b: { mood: "focus", energy: 50 },
+  },
+  continuity: { gap_ms: 0, predicted_ratio: 0, id_switch_rate: 0, health: "good" },
+  player: null,
+  roundSyncPerf: performance.now(),
+};
+
 function wsUrl() {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
   return `${scheme}://${window.location.host}/ws`;
+}
+
+function trimSet(setObj, maxSize) {
+  while (setObj.size > maxSize) {
+    const first = setObj.values().next().value;
+    if (first == null) {
+      return;
+    }
+    setObj.delete(first);
+  }
+}
+
+function resolveFrameSourceTsMs(payload) {
+  const frame = payload && payload.frame ? payload.frame : null;
+  const sourceTs = frame && Number.isFinite(frame.source_ts_ms) ? Number(frame.source_ts_ms) : null;
+  if (sourceTs != null && sourceTs > 0) {
+    return sourceTs;
+  }
+  const fallbackTs = payload && Number.isFinite(payload.frame_ts_ms) ? Number(payload.frame_ts_ms) : null;
+  if (fallbackTs != null && fallbackTs > 0) {
+    return fallbackTs;
+  }
+  return null;
+}
+
+function pushOverlaySnapshot(payload) {
+  const sourceTsMs = resolveFrameSourceTsMs(payload);
+  overlayFrameBuffer.push({
+    sourceTsMs,
+    frame: payload.frame || null,
+    detections: Array.isArray(payload.detections) ? payload.detections : [],
+    tracks: Array.isArray(payload.tracks) ? payload.tracks : [],
+  });
+  if (overlayFrameBuffer.length > maxOverlayFrameBuffer) {
+    overlayFrameBuffer.splice(0, overlayFrameBuffer.length - maxOverlayFrameBuffer);
+  }
+}
+
+function pickOverlaySnapshotForVideoTime() {
+  if (overlayFrameBuffer.length === 0) {
+    overlaySyncDeltaMs = 0;
+    return null;
+  }
+  if (!videoEl || !Number.isFinite(videoEl.currentTime) || videoEl.currentTime <= 0) {
+    overlaySyncDeltaMs = 0;
+    return overlayFrameBuffer[overlayFrameBuffer.length - 1];
+  }
+
+  const targetMs = videoEl.currentTime * 1000;
+  let best = null;
+  let bestCost = Number.POSITIVE_INFINITY;
+
+  for (let i = overlayFrameBuffer.length - 1; i >= 0; i -= 1) {
+    const item = overlayFrameBuffer[i];
+    if (!Number.isFinite(item.sourceTsMs)) {
+      continue;
+    }
+    const delta = item.sourceTsMs - targetMs;
+    if (delta > maxFutureOverlayLeadMs) {
+      continue;
+    }
+    const cost = Math.abs(delta) + (delta > 0 ? 240 : 0);
+    if (cost < bestCost) {
+      best = item;
+      bestCost = cost;
+      overlaySyncDeltaMs = Math.round(delta);
+    }
+    if (delta < -2200 && best !== null) {
+      break;
+    }
+  }
+
+  if (best === null) {
+    overlaySyncDeltaMs = 0;
+    return overlayFrameBuffer[overlayFrameBuffer.length - 1];
+  }
+  return best;
+}
+
+function pushEventLine(text, kind = "event") {
+  eventTimeline.unshift({ text, kind });
+  while (eventTimeline.length > 16) {
+    eventTimeline.pop();
+  }
+  eventFeedDirty = true;
+}
+
+function renderEventFeed(force = false) {
+  if (!eventFeedEl) {
+    return;
+  }
+  if (!force && !eventFeedDirty) {
+    return;
+  }
+  if (eventTimeline.length === 0) {
+    eventFeedEl.innerHTML = '<div class="event-item">等待实时事件...</div>';
+    eventFeedDirty = false;
+    return;
+  }
+  eventFeedEl.innerHTML = eventTimeline
+    .map((item) => `<div class="event-item ${item.kind}">${item.text}</div>`)
+    .join("");
+  eventFeedDirty = false;
+}
+
+function updateEntitiesFromPayload(payloadEntities, nowPerf) {
+  const seen = new Set();
+  for (const e of payloadEntities) {
+    seen.add(e.id);
+    const current = entities.get(e.id);
+    if (!current) {
+      entities.set(e.id, {
+        id: e.id,
+        type: e.type,
+        team: e.team,
+        x: e.x,
+        y: e.y,
+        targetX: e.x,
+        targetY: e.y,
+        updatedAt: nowPerf,
+      });
+      continue;
+    }
+    current.type = e.type;
+    current.team = e.team;
+    current.targetX = e.x;
+    current.targetY = e.y;
+    current.updatedAt = nowPerf;
+  }
+  return seen;
+}
+
+function pruneStaleEntities(seen, nowPerf, ttlMs = 1000) {
+  for (const id of entities.keys()) {
+    if (seen.has(id)) {
+      continue;
+    }
+    const item = entities.get(id);
+    if (item && nowPerf - item.updatedAt > ttlMs) {
+      entities.delete(id);
+    }
+  }
+}
+
+function refreshMetaBar(continuity) {
+  metaEl.innerHTML = `
+      <span>seq: ${latestSeq}</span>
+      <span>entities: ${entities.size}</span>
+      <span>tracks: ${latestTracks.length}</span>
+      <span>detections: ${latestDetections.length}</span>
+      <span>latency: ${latestLatency} ms</span>
+      <span>backend: ${latestBackend}</span>
+      <span>process: ${latestProcess} ms</span>
+      <span>decode: ${latestDecode}</span>
+      <span>overlay_sync: ${overlaySyncDeltaMs} ms</span>
+      <span>continuity: ${continuity.health} gap=${continuity.gap_ms}ms</span>
+    `;
+}
+
+function applySkillsCatalog(items) {
+  if (!Array.isArray(items)) {
+    return;
+  }
+  for (const item of items) {
+    if (!item || !item.name) {
+      continue;
+    }
+    skillCatalog.set(item.name, {
+      name: item.name,
+      cooldown_ms: Number(item.cooldown_ms || 0),
+      energy_cost: Number(item.energy_cost || 0),
+      event_gate: Array.isArray(item.event_gate) ? item.event_gate : [],
+      score_multiplier: Number(item.score_multiplier || 1),
+    });
+  }
+}
+
+function phaseLabel(phase) {
+  if (phase === "LIVE") {
+    return "LIVE";
+  }
+  if (phase === "RESULT") {
+    return "RESULT";
+  }
+  return "LOBBY";
+}
+
+function formatRemainMs(ms) {
+  return `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
+}
+
+function apiJsonOptions(payload) {
+  return {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  };
 }
 
 async function loadVideoPreview() {
@@ -53,6 +359,7 @@ async function loadVideoPreview() {
     const previewUrl = health.video_preview_url || (health.runtime && health.runtime.video_preview_url);
     if (previewUrl) {
       videoEl.src = previewUrl;
+      videoEl.playbackRate = 1.0;
       videoHintEl.style.display = "none";
       videoEl.play().catch(() => {});
       return;
@@ -63,6 +370,300 @@ async function loadVideoPreview() {
 
   videoHintEl.style.display = "flex";
   videoHintEl.textContent = "当前数据源不是本地视频文件，页面仅显示映射与跟踪数据。";
+}
+
+function ingestGameEvents(items) {
+  if (!Array.isArray(items)) {
+    return;
+  }
+  for (const event of items) {
+    const eventId = String(event.id || `${event.type}_${event.ts_ms}`);
+    if (seenEventIds.has(eventId)) {
+      continue;
+    }
+    seenEventIds.add(eventId);
+    trimSet(seenEventIds, 160);
+    const team = teamNameMap[event.team] || "队伍";
+    const text = event.text || `${team} 触发 ${event.type}`;
+    pushEventLine(text, "event");
+  }
+}
+
+function ingestSkillEvents(items) {
+  if (!Array.isArray(items)) {
+    return;
+  }
+  for (const skill of items) {
+    const skillId = String(skill.id || `${skill.skill}_${skill.ts_ms}`);
+    if (seenSkillIds.has(skillId)) {
+      continue;
+    }
+    seenSkillIds.add(skillId);
+    trimSet(seenSkillIds, 160);
+    const team = teamNameMap[skill.team] || "队伍";
+    const quality = String(skill.quality || "MISS").toUpperCase();
+    const type = quality === "MISS" ? "warn" : "skill";
+    const text = `${team} ${skill.skill} ${quality}`;
+    pushEventLine(text, type);
+  }
+}
+
+function showResultModal(result, highlight) {
+  if (!result || !resultModalEl) {
+    return;
+  }
+  const roundId = Number(result.round_id || 0);
+  if (roundId <= 0 || roundId === shownResultRoundId) {
+    return;
+  }
+  shownResultRoundId = roundId;
+
+  const scoreA = result.score && Number.isFinite(result.score.A) ? result.score.A : 0;
+  const scoreB = result.score && Number.isFinite(result.score.B) ? result.score.B : 0;
+  const winnerLabel =
+    result.winner === "DRAW" ? "平局" : `${teamNameMap[result.winner] || "队伍"} 胜出`;
+  const mvpTeam = result.mvp_team || "A";
+
+  resultTitleEl.textContent = highlight && highlight.title ? highlight.title : `第 ${roundId} 回合结算`;
+  resultSubtitleEl.textContent =
+    highlight && highlight.subtitle ? highlight.subtitle : `${winnerLabel} · 90 秒快局`;
+  resultScoreEl.textContent = `${scoreA} : ${scoreB}`;
+  resultMvpEl.textContent = `MVP: ${teamNameMap[mvpTeam] || "队伍"}`;
+  resultModalEl.classList.remove("hidden");
+  document.body.classList.add("modal-open");
+}
+
+function hideResultModal() {
+  if (resultModalEl) {
+    resultModalEl.classList.add("hidden");
+  }
+  document.body.classList.remove("modal-open");
+}
+
+function applyGameSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return;
+  }
+  if (snapshot.game_round) {
+    gameView.round = { ...gameView.round, ...snapshot.game_round };
+    gameView.roundSyncPerf = performance.now();
+  }
+  if (snapshot.game_score) {
+    gameView.score = { ...gameView.score, ...snapshot.game_score };
+  }
+  if (snapshot.game_mascot) {
+    gameView.mascot = {
+      team_a: { ...gameView.mascot.team_a, ...(snapshot.game_mascot.team_a || {}) },
+      team_b: { ...gameView.mascot.team_b, ...(snapshot.game_mascot.team_b || {}) },
+    };
+  }
+  if (snapshot.continuity_health) {
+    gameView.continuity = { ...gameView.continuity, ...snapshot.continuity_health };
+  }
+  if (snapshot.player !== undefined) {
+    gameView.player = snapshot.player;
+    joinedTeam = snapshot.player && snapshot.player.team ? snapshot.player.team : joinedTeam;
+  }
+  if (snapshot.skills_catalog) {
+    applySkillsCatalog(snapshot.skills_catalog);
+  }
+  ingestGameEvents(snapshot.game_events);
+  ingestSkillEvents(snapshot.game_skills);
+  if (snapshot.game_result) {
+    showResultModal(snapshot.game_result, snapshot.game_highlight || null);
+  }
+  renderEventFeed();
+  renderGameHud();
+}
+
+function renderGameHud() {
+  const round = gameView.round || {};
+  const score = gameView.score || {};
+  const mascot = gameView.mascot || {};
+  const player = gameView.player;
+  const nowPerf = performance.now();
+  const elapsedSync = nowPerf - gameView.roundSyncPerf;
+  const displayRemain = Math.max(0, Number(round.remain_ms || 0) - elapsedSync);
+  document.body.dataset.phase = String(round.phase || "LOBBY").toLowerCase();
+
+  scoreAEl.textContent = String(Number(score.team_a || 0));
+  scoreBEl.textContent = String(Number(score.team_b || 0));
+  comboAEl.textContent = `x${Number(score.combo_a || 1).toFixed(2)}`;
+  comboBEl.textContent = `x${Number(score.combo_b || 1).toFixed(2)}`;
+  roundPhaseEl.textContent = phaseLabel(round.phase || "LOBBY");
+  roundRemainEl.textContent = formatRemainMs(displayRemain);
+
+  mascotMoodAEl.textContent = moodLabelMap[(mascot.team_a && mascot.team_a.mood) || "focus"] || "focus";
+  mascotMoodBEl.textContent = moodLabelMap[(mascot.team_b && mascot.team_b.mood) || "focus"] || "focus";
+  mascotEnergyAEl.textContent = String(Number((mascot.team_a && mascot.team_a.energy) || 0));
+  mascotEnergyBEl.textContent = String(Number((mascot.team_b && mascot.team_b.energy) || 0));
+
+  if (player && player.team) {
+    joinedTeam = player.team;
+    playerBadgeEl.textContent = `已加入 ${teamNameMap[player.team]} · ${localUserId}`;
+    energyTextEl.textContent = `能量 ${Number(player.energy || 0)} / 100`;
+  } else if (joinedTeam) {
+    playerBadgeEl.textContent = `已加入 ${teamNameMap[joinedTeam]} · ${localUserId}`;
+    energyTextEl.textContent = "能量等待同步";
+  } else {
+    playerBadgeEl.textContent = "未加入阵营";
+    energyTextEl.textContent = "能量 0 / 100";
+  }
+  document.body.dataset.team = joinedTeam ? String(joinedTeam).toLowerCase() : "none";
+
+  joinAEl.disabled = joinedTeam === "A";
+  joinBEl.disabled = joinedTeam === "B";
+
+  const phase = round.phase || "LOBBY";
+  const cooldowns = (player && player.cooldowns) || {};
+  const playerEnergy = Number((player && player.energy) || 0);
+  for (const button of skillButtons) {
+    const skill = button.dataset.skill;
+    const cfg = skillCatalog.get(skill) || { energy_cost: 99, cooldown_ms: 0 };
+    const cooldownMs = Number(cooldowns[skill] || 0);
+    const canPlay =
+      Boolean(joinedTeam) &&
+      phase === "LIVE" &&
+      !pendingAction &&
+      playerEnergy >= Number(cfg.energy_cost || 0) &&
+      cooldownMs <= 0;
+    button.classList.toggle("disabled", !canPlay);
+    button.classList.toggle("cooling", cooldownMs > 0);
+    button.disabled = !canPlay;
+
+    const costEl = button.querySelector(".skill-cost");
+    if (costEl) {
+      costEl.textContent = String(Number(cfg.energy_cost || 0));
+    }
+    const metaEl = button.querySelector(".skill-meta");
+    if (metaEl) {
+      metaEl.textContent = skillLabelMap[skill] || "技能";
+    }
+    const cdEl = button.querySelector(".skill-cooldown");
+    if (cdEl) {
+      cdEl.textContent = cooldownMs > 0 ? `${(cooldownMs / 1000).toFixed(1)}s` : "";
+    }
+  }
+}
+
+function markSkillFeedback(skill, quality) {
+  const button = skillButtons.find((item) => item.dataset.skill === skill);
+  if (!button) {
+    return;
+  }
+  button.classList.remove("feedback-perfect", "feedback-good", "feedback-miss");
+  if (quality === "PERFECT") {
+    button.classList.add("feedback-perfect");
+    document.body.classList.remove("fx-good", "fx-miss");
+    document.body.classList.add("fx-perfect");
+  } else if (quality === "GOOD") {
+    button.classList.add("feedback-good");
+    document.body.classList.remove("fx-perfect", "fx-miss");
+    document.body.classList.add("fx-good");
+  } else {
+    button.classList.add("feedback-miss");
+    document.body.classList.remove("fx-perfect", "fx-good");
+    document.body.classList.add("fx-miss");
+  }
+  window.setTimeout(() => {
+    button.classList.remove("feedback-perfect", "feedback-good", "feedback-miss");
+    document.body.classList.remove("fx-perfect", "fx-good", "fx-miss");
+  }, 420);
+}
+
+async function fetchGameState() {
+  try {
+    const res = await fetch(`/api/game/state?user_id=${encodeURIComponent(localUserId)}`, {
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      return;
+    }
+    const state = await res.json();
+    applyGameSnapshot(state);
+  } catch (error) {
+    console.warn("failed to load game state", error);
+  }
+}
+
+async function joinTeam(team) {
+  try {
+    const res = await fetch("/api/game/join", apiJsonOptions({ user_id: localUserId, team }));
+    if (!res.ok) {
+      return;
+    }
+    const payload = await res.json();
+    joinedTeam = team;
+    applyGameSnapshot(payload.state || {});
+    pushEventLine(`你加入了${teamNameMap[team]}阵营`, "skill");
+    renderEventFeed();
+  } catch (error) {
+    console.warn("join failed", error);
+  }
+}
+
+async function triggerSkill(skill) {
+  if (!joinedTeam || pendingAction) {
+    return;
+  }
+  pendingAction = true;
+  renderGameHud();
+  try {
+    const res = await fetch(
+      "/api/game/action",
+      apiJsonOptions({
+        user_id: localUserId,
+        team: joinedTeam,
+        skill,
+      })
+    );
+    if (!res.ok) {
+      pushEventLine("技能请求失败", "warn");
+      return;
+    }
+    const payload = await res.json();
+    if (payload.resolution) {
+      const quality = String(payload.resolution.quality || "MISS").toUpperCase();
+      markSkillFeedback(skill, quality);
+      const message = payload.resolution.message || `${skill} ${quality}`;
+      pushEventLine(message, quality === "MISS" ? "warn" : "skill");
+    }
+    if (payload.state) {
+      applyGameSnapshot(payload.state);
+    } else {
+      renderGameHud();
+    }
+  } catch (error) {
+    console.warn("action failed", error);
+    pushEventLine("技能请求异常", "warn");
+  } finally {
+    pendingAction = false;
+    renderEventFeed();
+    renderGameHud();
+  }
+}
+
+function bindGameControls() {
+  joinAEl.addEventListener("click", () => joinTeam("A"));
+  joinBEl.addEventListener("click", () => joinTeam("B"));
+  for (const button of skillButtons) {
+    button.addEventListener("click", () => {
+      const skill = button.dataset.skill;
+      if (skill) {
+        triggerSkill(skill);
+      }
+    });
+  }
+  if (resultCloseEl) {
+    resultCloseEl.addEventListener("click", hideResultModal);
+  }
+  if (resultModalEl) {
+    resultModalEl.addEventListener("click", (event) => {
+      if (event.target === resultModalEl) {
+        hideResultModal();
+      }
+    });
+  }
 }
 
 function connect() {
@@ -100,53 +701,16 @@ function connect() {
     latestDetections = Array.isArray(data.detections) ? data.detections : [];
     latestTracks = Array.isArray(data.tracks) ? data.tracks : [];
     latestFrame = data.frame || latestFrame;
+    pushOverlaySnapshot(data);
     syncVideoTimeToFrame(latestFrame);
 
-    const seen = new Set();
     const now = performance.now();
     const payloadEntities = Array.isArray(data.entities) ? data.entities : [];
-    for (const e of payloadEntities) {
-      seen.add(e.id);
-      const current = entities.get(e.id);
-      if (!current) {
-        entities.set(e.id, {
-          id: e.id,
-          type: e.type,
-          team: e.team,
-          x: e.x,
-          y: e.y,
-          targetX: e.x,
-          targetY: e.y,
-          updatedAt: now,
-        });
-      } else {
-        current.type = e.type;
-        current.team = e.team;
-        current.targetX = e.x;
-        current.targetY = e.y;
-        current.updatedAt = now;
-      }
-    }
+    const seen = updateEntitiesFromPayload(payloadEntities, now);
+    pruneStaleEntities(seen, now, 1000);
 
-    for (const id of entities.keys()) {
-      if (!seen.has(id)) {
-        const item = entities.get(id);
-        if (item && now - item.updatedAt > 1000) {
-          entities.delete(id);
-        }
-      }
-    }
-
-    metaEl.innerHTML = `
-      <span>seq: ${latestSeq}</span>
-      <span>entities: ${entities.size}</span>
-      <span>tracks: ${latestTracks.length}</span>
-      <span>detections: ${latestDetections.length}</span>
-      <span>latency: ${latestLatency} ms</span>
-      <span>backend: ${latestBackend}</span>
-      <span>process: ${latestProcess} ms</span>
-      <span>decode: ${latestDecode}</span>
-    `;
+    applyGameSnapshot(data);
+    refreshMetaBar(gameView.continuity || {});
   });
 }
 
@@ -158,18 +722,45 @@ function syncVideoTimeToFrame(frameInfo) {
     return;
   }
   const now = performance.now();
-  if (now - lastVideoSyncAt < 180) {
+  if (now - lastVideoSyncAt < videoSyncConfig.minSyncIntervalMs) {
     return;
   }
   lastVideoSyncAt = now;
 
   const targetSeconds = Math.max(0, frameInfo.source_ts_ms / 1000);
-  const drift = Math.abs(videoEl.currentTime - targetSeconds);
-  if (drift > 0.25) {
-    const safeTarget = Math.min(videoEl.duration - 0.05, targetSeconds);
-    if (safeTarget >= 0) {
+  const safeTarget = Math.min(Math.max(0, videoEl.duration - 0.05), targetSeconds);
+  const signedDrift = safeTarget - videoEl.currentTime;
+  const driftAbs = Math.abs(signedDrift);
+
+  if (driftAbs >= videoSyncConfig.hardSeekDriftSec) {
+    if (now - lastHardSeekAt >= videoSyncConfig.hardSeekCooldownMs) {
       videoEl.currentTime = safeTarget;
+      videoEl.playbackRate = 1.0;
+      videoRateUntil = 0;
+      lastHardSeekAt = now;
     }
+    return;
+  }
+
+  if (driftAbs >= videoSyncConfig.softDriftSec) {
+    const rateAdjust = clamp(
+      signedDrift * videoSyncConfig.rateGain,
+      -videoSyncConfig.maxRateDelta,
+      videoSyncConfig.maxRateDelta
+    );
+    const nextRate = clamp(1.0 + rateAdjust, videoSyncConfig.minRate, videoSyncConfig.maxRate);
+    if (Math.abs((videoEl.playbackRate || 1.0) - nextRate) > 0.01) {
+      videoEl.playbackRate = nextRate;
+    }
+    videoRateUntil = now + videoSyncConfig.rateHoldMs;
+    return;
+  }
+
+  if (videoRateUntil > 0 && now >= videoRateUntil) {
+    if (Math.abs((videoEl.playbackRate || 1.0) - 1.0) > 0.01) {
+      videoEl.playbackRate = 1.0;
+    }
+    videoRateUntil = 0;
   }
 }
 
@@ -480,15 +1071,21 @@ function drawVideoOverlay() {
   const { width: canvasW, height: canvasH } = syncOverlayCanvas();
   overlayCtx.clearRect(0, 0, canvasW, canvasH);
 
-  const frameW = latestFrame.width || videoEl.videoWidth || 1;
-  const frameH = latestFrame.height || videoEl.videoHeight || 1;
+  const synced = pickOverlaySnapshotForVideoTime();
+  const drawFrame = (synced && synced.frame) || latestFrame;
+  const detections = (synced && synced.detections) || latestDetections;
+  const tracks = (synced && synced.tracks) || latestTracks;
+
+  const frameW = drawFrame.width || videoEl.videoWidth || 1;
+  const frameH = drawFrame.height || videoEl.videoHeight || 1;
   const sx = canvasW / frameW;
   const sy = canvasH / frameH;
 
   overlayCtx.setLineDash([6, 4]);
   overlayCtx.lineWidth = 1.5;
   overlayCtx.strokeStyle = "rgba(255, 224, 87, 0.9)";
-  for (const det of latestDetections) {
+  const detectionsToDraw = detections;
+  for (const det of detectionsToDraw) {
     const x = det.x * sx;
     const y = det.y * sy;
     const w = det.w * sx;
@@ -499,7 +1096,8 @@ function drawVideoOverlay() {
   overlayCtx.setLineDash([]);
   overlayCtx.font = "12px sans-serif";
   overlayCtx.textBaseline = "top";
-  for (const track of latestTracks) {
+  const tracksToDraw = tracks;
+  for (const track of tracksToDraw) {
     const x = track.x * sx;
     const y = track.y * sy;
     const w = track.w * sx;
@@ -509,6 +1107,10 @@ function drawVideoOverlay() {
     overlayCtx.strokeStyle = color;
     overlayCtx.lineWidth = 2.4;
     overlayCtx.strokeRect(x, y, w, h);
+
+    if (isMobileDevice && track.type !== "ball") {
+      continue;
+    }
 
     const label = `${track.id} ${track.type} ${(track.conf * 100).toFixed(0)}%`;
     const textWidth = overlayCtx.measureText(label).width;
@@ -964,13 +1566,32 @@ function drawPitchScene() {
   }
 }
 
-function render() {
-  drawVideoOverlay();
-  drawPitchScene();
+function render(now = performance.now()) {
+  const overlayIntervalMs = isMobileDevice ? 33 : 33;
+  const pitchIntervalMs = isMobileDevice ? 42 : 28;
+
+  if (now - lastOverlayRenderAt >= overlayIntervalMs) {
+    drawVideoOverlay();
+    lastOverlayRenderAt = now;
+  }
+
+  if (now - lastPitchRenderAt >= pitchIntervalMs) {
+    drawPitchScene();
+    lastPitchRenderAt = now;
+  }
+
+  renderGameHud();
   requestAnimationFrame(render);
 }
 
-loadVideoPreview();
-connect();
-setupPitchCameraControls();
-render();
+async function bootstrap() {
+  bindGameControls();
+  renderEventFeed(true);
+  renderGameHud();
+  await Promise.all([loadVideoPreview(), fetchGameState()]);
+  connect();
+  setupPitchCameraControls();
+  render();
+}
+
+bootstrap();

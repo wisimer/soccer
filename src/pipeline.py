@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from .detector import DetectorProtocol, HeuristicDetector
+from .game_engine import GameEngine
 from .postprocess import TrackPostProcessor
 from .projector import PITCH_LENGTH_M, PITCH_WIDTH_M, LinearProjector, ProjectorProtocol
 from .recorder import JsonlRecorder
 from .tracker import NearestTracker, TrackerProtocol
 from .video_reader import BufferedVideoReader, DecodeConfig
 
-SCHEMA_VERSION = "1.3"
+SCHEMA_VERSION = "1.5"
 
 
 def _fallback_bbox(kind: str, x_px: float, y_px: float) -> tuple[float, float, float, float]:
@@ -22,6 +24,14 @@ def _fallback_bbox(kind: str, x_px: float, y_px: float) -> tuple[float, float, f
     width = 24.0
     height = 52.0
     return (x_px - width / 2.0, y_px - height, width, height)
+
+
+@dataclass(slots=True)
+class _ContinuityState:
+    predicted_ratio: float = 0.0
+    id_switch_rate: float = 0.0
+    last_ball_seen_ms: int | None = None
+    last_player_ids: set[int] | None = None
 
 
 class StreamProcessor:
@@ -36,7 +46,9 @@ class StreamProcessor:
         decode_config: DecodeConfig | None = None,
         postprocessor: TrackPostProcessor | None = None,
         recorder: JsonlRecorder | None = None,
+        game_engine: GameEngine | None = None,
         prefer_latest_frame: bool = True,
+        continuity_window_ms: int = 1200,
     ) -> None:
         self.source_arg = source
         self.target_fps = target_fps
@@ -51,12 +63,117 @@ class StreamProcessor:
         )
         self.postprocessor = postprocessor or TrackPostProcessor()
         self.recorder = recorder
+        self.game_engine = game_engine or GameEngine()
         self.prefer_latest_frame = prefer_latest_frame
+        self.continuity_window_ms = max(200, int(continuity_window_ms))
         self.running = True
         self.seq = 1
+        self._continuity = _ContinuityState()
+        self._last_ball_entity: dict[str, Any] | None = None
+        self._last_ball_track: dict[str, Any] | None = None
 
     def stop(self) -> None:
         self.running = False
+
+    def _estimate_continuity(self, tracks: list[Any], ts_ms: int) -> dict[str, Any]:
+        has_ball = any(getattr(track, "kind", "") == "ball" for track in tracks)
+        if has_ball:
+            self._continuity.last_ball_seen_ms = ts_ms
+
+        gap_ms = 0
+        if self._continuity.last_ball_seen_ms is None:
+            gap_ms = self.continuity_window_ms
+        else:
+            gap_ms = max(0, ts_ms - self._continuity.last_ball_seen_ms)
+
+        predicted_count = sum(1 for track in tracks if int(getattr(track, "missed_frames", 0)) > 0)
+        instant_predicted_ratio = (predicted_count / len(tracks)) if tracks else 0.0
+        self._continuity.predicted_ratio = (
+            self._continuity.predicted_ratio * 0.82 + instant_predicted_ratio * 0.18
+        )
+
+        player_ids = {
+            int(getattr(track, "track_id"))
+            for track in tracks
+            if getattr(track, "kind", "") == "player"
+        }
+        if self._continuity.last_player_ids is not None:
+            union = player_ids | self._continuity.last_player_ids
+            instant_switch = (len(player_ids ^ self._continuity.last_player_ids) / len(union)) if union else 0.0
+            self._continuity.id_switch_rate = (
+                self._continuity.id_switch_rate * 0.8 + instant_switch * 0.2
+            )
+        self._continuity.last_player_ids = player_ids
+
+        health = "good"
+        if (
+            gap_ms > self.continuity_window_ms
+            or self._continuity.predicted_ratio > 0.55
+            or self._continuity.id_switch_rate > 0.45
+        ):
+            health = "bad"
+        elif (
+            gap_ms > int(self.continuity_window_ms * 0.35)
+            or self._continuity.predicted_ratio > 0.25
+            or self._continuity.id_switch_rate > 0.22
+        ):
+            health = "warn"
+
+        return {
+            "gap_ms": int(gap_ms),
+            "predicted_ratio": round(float(self._continuity.predicted_ratio), 3),
+            "id_switch_rate": round(float(self._continuity.id_switch_rate), 3),
+            "health": health,
+        }
+
+    def _apply_ball_continuity(
+        self,
+        entities: list[dict[str, Any]],
+        track_payload: list[dict[str, Any]],
+        ts_ms: int,
+    ) -> None:
+        if any(item.get("type") == "ball" for item in entities):
+            return
+        if self._continuity.last_ball_seen_ms is None:
+            return
+        if self._last_ball_entity is None:
+            return
+
+        gap_ms = max(0, ts_ms - self._continuity.last_ball_seen_ms)
+        if gap_ms > self.continuity_window_ms:
+            return
+
+        dt_s = gap_ms / 1000.0
+        decay = max(0.2, 1.0 - gap_ms / max(1, self.continuity_window_ms))
+
+        ghost = dict(self._last_ball_entity)
+        ghost["x"] = round(float(ghost.get("x", 0.0)) + float(ghost.get("vx", 0.0)) * dt_s, 2)
+        ghost["y"] = round(float(ghost.get("y", 0.0)) + float(ghost.get("vy", 0.0)) * dt_s, 2)
+        ghost["x"] = max(0.0, min(float(PITCH_LENGTH_M), float(ghost["x"])))
+        ghost["y"] = max(0.0, min(float(PITCH_WIDTH_M), float(ghost["y"])))
+        ghost["conf"] = round(max(0.05, float(ghost.get("conf", 0.4)) * decay), 3)
+        ghost["predicted"] = True
+        entities.append(ghost)
+
+        if self._last_ball_track is not None:
+            last_track = self._last_ball_track
+            center_x = float(last_track["center_x"]) + float(last_track.get("vx_px", 0.0)) * dt_s
+            center_y = float(last_track["center_y"]) + float(last_track.get("vy_px", 0.0)) * dt_s
+            width = float(last_track["w"])
+            height = float(last_track["h"])
+            track_payload.append(
+                {
+                    "id": last_track["id"],
+                    "type": "ball",
+                    "team": last_track.get("team", "unknown"),
+                    "x": round(center_x - width * 0.5, 2),
+                    "y": round(center_y - height * 0.5, 2),
+                    "w": round(width, 2),
+                    "h": round(height, 2),
+                    "conf": round(max(0.05, float(last_track.get("conf", 0.4)) * decay), 3),
+                    "predicted": True,
+                }
+            )
 
     async def run(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
         min_interval_s = 1.0 / max(1, self.target_fps)
@@ -116,18 +233,17 @@ class StreamProcessor:
                         track.vx_px,
                         track.vy_px,
                     )
-                    entities.append(
-                        {
-                            "id": track.track_id,
-                            "type": track.kind,
-                            "team": track.team,
-                            "x": round(x_m, 2),
-                            "y": round(y_m, 2),
-                            "vx": round(vx_m, 2),
-                            "vy": round(vy_m, 2),
-                            "conf": round(float(track.confidence), 3),
-                        }
-                    )
+                    entity_item = {
+                        "id": track.track_id,
+                        "type": track.kind,
+                        "team": track.team,
+                        "x": round(x_m, 2),
+                        "y": round(y_m, 2),
+                        "vx": round(vx_m, 2),
+                        "vy": round(vy_m, 2),
+                        "conf": round(float(track.confidence), 3),
+                    }
+                    entities.append(entity_item)
                     if (
                         track.bbox_x is None
                         or track.bbox_y is None
@@ -140,18 +256,39 @@ class StreamProcessor:
                         bbox_y = track.bbox_y
                         bbox_w = track.bbox_w
                         bbox_h = track.bbox_h
-                    track_payload.append(
-                        {
+                    track_item = {
+                        "id": track.track_id,
+                        "type": track.kind,
+                        "team": track.team,
+                        "x": round(float(bbox_x), 2),
+                        "y": round(float(bbox_y), 2),
+                        "w": round(float(max(1.0, bbox_w)), 2),
+                        "h": round(float(max(1.0, bbox_h)), 2),
+                        "conf": round(float(track.confidence), 3),
+                    }
+                    track_payload.append(track_item)
+
+                    if track.kind == "ball":
+                        self._last_ball_entity = dict(entity_item)
+                        self._last_ball_track = {
                             "id": track.track_id,
-                            "type": track.kind,
                             "team": track.team,
-                            "x": round(float(bbox_x), 2),
-                            "y": round(float(bbox_y), 2),
-                            "w": round(float(max(1.0, bbox_w)), 2),
-                            "h": round(float(max(1.0, bbox_h)), 2),
-                            "conf": round(float(track.confidence), 3),
+                            "center_x": float(track.x_px),
+                            "center_y": float(track.y_px),
+                            "vx_px": float(track.vx_px),
+                            "vy_px": float(track.vy_px),
+                            "w": float(max(1.0, bbox_w)),
+                            "h": float(max(1.0, bbox_h)),
+                            "conf": float(track.confidence),
                         }
-                    )
+
+                continuity_health = self._estimate_continuity(tracks, process_ts_ms)
+                self._apply_ball_continuity(entities, track_payload, process_ts_ms)
+                game_payload = self.game_engine.update_from_frame(
+                    entities=entities,
+                    ts_ms=process_ts_ms,
+                    continuity_health=continuity_health,
+                )
 
                 decode_stats = self.reader.stats()
                 payload = {
@@ -172,6 +309,7 @@ class StreamProcessor:
                     "detections": detection_payload,
                     "tracks": track_payload,
                     "entities": entities,
+                    **game_payload,
                     "meta": {
                         "detector": getattr(self.detector, "name", self.detector.__class__.__name__),
                         "tracker": getattr(self.tracker, "name", self.tracker.__class__.__name__),
