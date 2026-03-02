@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
-
 from .events import GameEvent
 
 
@@ -121,17 +119,22 @@ SKILL_CONFIGS: dict[str, SkillConfig] = {
         window_after_ms=1800,
     ),
 }
+SKILL_CONFIGS_BY_LOWER: dict[str, SkillConfig] = {
+    name.lower(): config for name, config in SKILL_CONFIGS.items()
+}
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
 
 
 def get_skill_config(skill_name: str) -> SkillConfig | None:
     if skill_name in SKILL_CONFIGS:
         return SKILL_CONFIGS[skill_name]
-
     normalized = str(skill_name).strip().lower()
-    for key, cfg in SKILL_CONFIGS.items():
-        if key.lower() == normalized:
-            return cfg
-    return None
+    if not normalized:
+        return None
+    return SKILL_CONFIGS_BY_LOWER.get(normalized)
 
 
 def list_skills() -> list[dict[str, Any]]:
@@ -178,7 +181,7 @@ def resolve_action_quality(
     if best_event is None:
         return ("MISS", None, None)
 
-    confidence = float(np.clip(best_event.confidence, 0.0, 1.0))
+    confidence = float(_clamp(float(best_event.confidence), 0.0, 1.0))
     max_window = max(config.window_before_ms, config.window_after_ms, 1)
     distance_score = 1.0 - min(1.0, abs(float(best_delta or 0)) / float(max_window))
 

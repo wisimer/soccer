@@ -6,8 +6,6 @@ from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any
 
-import numpy as np
-
 from .events import EventEngine, GameEvent, TEAM_LABEL
 from .highlights import build_round_highlight
 from .skills import (
@@ -28,6 +26,10 @@ class PlayerState:
     last_action_ts_ms: int = 0
     cooldowns: dict[str, int] = field(default_factory=dict)
     consumed_event_ids: set[str] = field(default_factory=set)
+
+
+def _clip_int(value: float, lo: int, hi: int) -> int:
+    return int(max(lo, min(hi, value)))
 
 
 class GameEngine:
@@ -112,17 +114,12 @@ class GameEngine:
                 }
 
             new_events = self._event_engine.update(entities, now)
-            if self._phase == "LIVE":
-                for event in new_events:
-                    score_delta = self._apply_event_score(event)
-                    item = event.to_dict()
-                    item["score_delta"] = score_delta
-                    self._recent_events.append(item)
-            else:
-                for event in new_events:
-                    item = event.to_dict()
-                    item["score_delta"] = 0
-                    self._recent_events.append(item)
+            is_live = self._phase == "LIVE"
+            for event in new_events:
+                score_delta = self._apply_event_score(event) if is_live else 0
+                event_item = event.to_dict()
+                event_item["score_delta"] = score_delta
+                self._recent_events.append(event_item)
 
             self._update_mascot_state()
             payload = self._snapshot(now)
@@ -230,13 +227,6 @@ class GameEngine:
                     event_id = matched_event.event_id
                     event_type = matched_event.type
 
-            message = (
-                "技能命中！"
-                if success and quality == "GOOD"
-                else "完美命中！"
-                if success and quality == "PERFECT"
-                else "未命中事件窗口。"
-            )
             resolution = SkillResolution(
                 action_id=action_id,
                 user_id=user_id,
@@ -247,7 +237,7 @@ class GameEngine:
                 ts_ms=now,
                 score_delta=score_delta,
                 fx_style=config.fx_style,
-                message=message,
+                message=self._resolution_message(success=success, quality=quality),
                 event_id=event_id,
                 event_type=event_type,
             )
@@ -328,30 +318,16 @@ class GameEngine:
 
         if self._phase == "LOBBY":
             self._start_live(now)
-            return
-        if self._phase == "LIVE":
+        elif self._phase == "LIVE":
             self._finish_round(now)
-            return
-        if self._phase == "RESULT":
+        elif self._phase == "RESULT":
             self._start_next_round(now)
-            return
 
     def _start_live(self, now: int) -> None:
         self._phase = "LIVE"
         self._phase_started_ms = now
         self._phase_duration_ms = self.live_ms
-        self._score = {"A": 0, "B": 0}
-        self._combo_count = {"A": 0, "B": 0}
-        self._combo_mul = {"A": 1.0, "B": 1.0}
-        self._last_combo_ts_ms = {"A": None, "B": None}
-        self._recent_events.clear()
-        self._recent_skills.clear()
-        self._latest_result = None
-        self._latest_highlight = None
-        for player in self._players.values():
-            player.energy = self.per_round_energy
-            player.cooldowns.clear()
-            player.consumed_event_ids.clear()
+        self._reset_round_runtime(clear_results=True)
 
     def _finish_round(self, now: int) -> None:
         score_a = int(self._score["A"])
@@ -390,12 +366,18 @@ class GameEngine:
         self._phase = "LOBBY"
         self._phase_started_ms = now
         self._phase_duration_ms = self.lobby_ms
+        self._reset_round_runtime(clear_results=False)
+
+    def _reset_round_runtime(self, clear_results: bool) -> None:
         self._score = {"A": 0, "B": 0}
         self._combo_count = {"A": 0, "B": 0}
         self._combo_mul = {"A": 1.0, "B": 1.0}
         self._last_combo_ts_ms = {"A": None, "B": None}
         self._recent_events.clear()
         self._recent_skills.clear()
+        if clear_results:
+            self._latest_result = None
+            self._latest_highlight = None
         for player in self._players.values():
             player.energy = self.per_round_energy
             player.cooldowns.clear()
@@ -425,11 +407,11 @@ class GameEngine:
         self._mood["A"] = self._calc_mood(diff)
         self._mood["B"] = self._calc_mood(-diff)
 
-        self._mascot_energy["A"] = int(
-            np.clip(45 + self._combo_count["A"] * 8 + max(0, diff) * 0.5, 0, 100)
-        )
-        self._mascot_energy["B"] = int(
-            np.clip(45 + self._combo_count["B"] * 8 + max(0, -diff) * 0.5, 0, 100)
+        self._mascot_energy["A"] = _clip_int(45 + self._combo_count["A"] * 8 + max(0, diff) * 0.5, 0, 100)
+        self._mascot_energy["B"] = _clip_int(
+            45 + self._combo_count["B"] * 8 + max(0, -diff) * 0.5,
+            0,
+            100,
         )
 
     @staticmethod
@@ -467,6 +449,14 @@ class GameEngine:
         )
         self._next_action_id += 1
         return {"ok": False, "resolution": resolution.to_dict()}
+
+    @staticmethod
+    def _resolution_message(success: bool, quality: str) -> str:
+        if not success:
+            return "未命中事件窗口。"
+        if quality == "PERFECT":
+            return "完美命中！"
+        return "技能命中！"
 
     @staticmethod
     def _now_ms() -> int:

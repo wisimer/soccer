@@ -74,6 +74,32 @@ const moodLabelMap = {
   tense: "tense",
   tilt: "tilt",
 };
+const actionLabelMap = {
+  attack: "闪电进攻",
+  defend: "铜墙防守",
+  hype: "狂热连击",
+};
+const actionPlanMap = {
+  attack: ["ShotBuff", "BoostPass"],
+  defend: ["GoalGuard", "StealAura"],
+  hype: ["ComboLock", "HypeRoar"],
+};
+const actionMetaMap = {
+  attack: "自动择优：射门/传导",
+  defend: "自动择优：守门/抢断",
+  hype: "自动择优：连击/狂热",
+};
+const eventHintMap = {
+  possession_start: "attack",
+  pass_complete: "attack",
+  steal: "defend",
+  shot_attempt: "attack",
+  danger_moment: "hype",
+};
+const skillToActionMap = Object.fromEntries(
+  Object.entries(actionPlanMap).flatMap(([action, skills]) => skills.map((skill) => [skill, action]))
+);
+const actionHintTTLms = 2300;
 
 const joinAEl = document.getElementById("joinA");
 const joinBEl = document.getElementById("joinB");
@@ -89,6 +115,8 @@ const mascotMoodBEl = document.getElementById("mascotMoodB");
 const mascotEnergyAEl = document.getElementById("mascotEnergyA");
 const mascotEnergyBEl = document.getElementById("mascotEnergyB");
 const energyTextEl = document.getElementById("energyText");
+const windowHintEl = document.getElementById("windowHint");
+const streakTextEl = document.getElementById("streakText");
 const eventFeedEl = document.getElementById("eventFeed");
 const resultModalEl = document.getElementById("resultModal");
 const resultTitleEl = document.getElementById("resultTitle");
@@ -96,7 +124,15 @@ const resultSubtitleEl = document.getElementById("resultSubtitle");
 const resultScoreEl = document.getElementById("resultScore");
 const resultMvpEl = document.getElementById("resultMvp");
 const resultCloseEl = document.getElementById("resultClose");
-const skillButtons = Array.from(document.querySelectorAll(".skill-card"));
+const actionButtons = Array.from(document.querySelectorAll(".action-card"));
+const actionViews = actionButtons.map((button) => ({
+  button,
+  action: button.dataset.action || "",
+  costEl: button.querySelector(".action-cost"),
+  metaEl: button.querySelector(".action-meta"),
+  skillEl: button.querySelector(".action-skill"),
+  cooldownEl: button.querySelector(".action-cooldown"),
+}));
 
 const defaultSkillCatalog = [
   { name: "BoostPass", cooldown_ms: 3800, energy_cost: 16 },
@@ -111,7 +147,6 @@ const skillCatalog = new Map(defaultSkillCatalog.map((item) => [item.name, item]
 const seenEventIds = new Set();
 const seenSkillIds = new Set();
 const eventTimeline = [];
-let eventFeedDirty = true;
 const overlayFrameBuffer = [];
 const maxOverlayFrameBuffer = isMobileDevice ? 320 : 260;
 let overlaySyncDeltaMs = 0;
@@ -134,6 +169,9 @@ const localUserId = (() => {
 
 let joinedTeam = null;
 let pendingAction = false;
+let localHitStreak = 0;
+let lastHintEventType = "";
+let lastHintEventTsMs = 0;
 let shownResultRoundId = 0;
 const gameView = {
   round: { id: 0, phase: "LOBBY", remain_ms: 0, started_ms: 0, duration_ms: 0 },
@@ -146,6 +184,7 @@ const gameView = {
   player: null,
   roundSyncPerf: performance.now(),
 };
+document.body.dataset.streakLevel = "0";
 
 function wsUrl() {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
@@ -163,16 +202,8 @@ function trimSet(setObj, maxSize) {
 }
 
 function resolveFrameSourceTsMs(payload) {
-  const frame = payload && payload.frame ? payload.frame : null;
-  const sourceTs = frame && Number.isFinite(frame.source_ts_ms) ? Number(frame.source_ts_ms) : null;
-  if (sourceTs != null && sourceTs > 0) {
-    return sourceTs;
-  }
-  const fallbackTs = payload && Number.isFinite(payload.frame_ts_ms) ? Number(payload.frame_ts_ms) : null;
-  if (fallbackTs != null && fallbackTs > 0) {
-    return fallbackTs;
-  }
-  return null;
+  const sourceTs = payload && payload.frame ? Number(payload.frame.source_ts_ms) : NaN;
+  return Number.isFinite(sourceTs) && sourceTs > 0 ? sourceTs : null;
 }
 
 function pushOverlaySnapshot(payload) {
@@ -234,25 +265,20 @@ function pushEventLine(text, kind = "event") {
   while (eventTimeline.length > 16) {
     eventTimeline.pop();
   }
-  eventFeedDirty = true;
+  renderEventFeed();
 }
 
-function renderEventFeed(force = false) {
+function renderEventFeed() {
   if (!eventFeedEl) {
-    return;
-  }
-  if (!force && !eventFeedDirty) {
     return;
   }
   if (eventTimeline.length === 0) {
     eventFeedEl.innerHTML = '<div class="event-item">等待实时事件...</div>';
-    eventFeedDirty = false;
     return;
   }
   eventFeedEl.innerHTML = eventTimeline
     .map((item) => `<div class="event-item ${item.kind}">${item.text}</div>`)
     .join("");
-  eventFeedDirty = false;
 }
 
 function updateEntitiesFromPayload(payloadEntities, nowPerf) {
@@ -349,6 +375,101 @@ function apiJsonOptions(payload) {
   };
 }
 
+function safeParseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function skillDisplayName(skill) {
+  return skillLabelMap[skill] || skill || "未知技能";
+}
+
+function resolveActionChoice(action, player) {
+  const fallback = {
+    action,
+    skill: null,
+    cooldownMs: 0,
+    energyCost: 0,
+    display: "无可用技能",
+  };
+  const candidates = actionPlanMap[action];
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    return fallback;
+  }
+
+  const cooldowns = (player && player.cooldowns) || {};
+  const energy = Number((player && player.energy) || 0);
+  const details = candidates
+    .map((skill) => {
+      const cfg = skillCatalog.get(skill);
+      if (!cfg) {
+        return null;
+      }
+      const energyCost = Number(cfg.energy_cost || 0);
+      const cooldownMs = Math.max(0, Number(cooldowns[skill] || 0));
+      return {
+        action,
+        skill,
+        cooldownMs,
+        energyCost,
+        display: skillDisplayName(skill),
+        ready: cooldownMs <= 0 && energy >= energyCost,
+        energyGap: Math.max(0, energyCost - energy),
+      };
+    })
+    .filter(Boolean);
+
+  if (details.length === 0) {
+    return fallback;
+  }
+
+  const ready = details.find((item) => item.ready);
+  if (ready) {
+    return ready;
+  }
+
+  details.sort((a, b) => {
+    if (a.energyGap !== b.energyGap) {
+      return a.energyGap - b.energyGap;
+    }
+    if (a.cooldownMs !== b.cooldownMs) {
+      return a.cooldownMs - b.cooldownMs;
+    }
+    return a.energyCost - b.energyCost;
+  });
+  return details[0];
+}
+
+function deriveHintAction() {
+  if (!lastHintEventType) {
+    return null;
+  }
+  if (Date.now() - lastHintEventTsMs > actionHintTTLms) {
+    return null;
+  }
+  return eventHintMap[lastHintEventType] || null;
+}
+
+function updateLocalHitStreak(quality) {
+  if (quality === "PERFECT" || quality === "GOOD") {
+    localHitStreak += 1;
+  } else {
+    localHitStreak = 0;
+  }
+  if (localHitStreak >= 6) {
+    document.body.dataset.streakLevel = "3";
+  } else if (localHitStreak >= 3) {
+    document.body.dataset.streakLevel = "2";
+  } else if (localHitStreak >= 1) {
+    document.body.dataset.streakLevel = "1";
+  } else {
+    document.body.dataset.streakLevel = "0";
+  }
+}
+
 async function loadVideoPreview() {
   try {
     const res = await fetch("/api/health", { cache: "no-store" });
@@ -356,7 +477,7 @@ async function loadVideoPreview() {
       throw new Error(`health status ${res.status}`);
     }
     const health = await res.json();
-    const previewUrl = health.video_preview_url || (health.runtime && health.runtime.video_preview_url);
+    const previewUrl = String(health.video_preview_url || "");
     if (previewUrl) {
       videoEl.src = previewUrl;
       videoEl.playbackRate = 1.0;
@@ -383,6 +504,11 @@ function ingestGameEvents(items) {
     }
     seenEventIds.add(eventId);
     trimSet(seenEventIds, 160);
+    const eventType = String(event.type || "");
+    if (eventHintMap[eventType]) {
+      lastHintEventType = eventType;
+      lastHintEventTsMs = Number(event.ts_ms || Date.now());
+    }
     const team = teamNameMap[event.team] || "队伍";
     const text = event.text || `${team} 触发 ${event.type}`;
     pushEventLine(text, "event");
@@ -403,7 +529,11 @@ function ingestSkillEvents(items) {
     const team = teamNameMap[skill.team] || "队伍";
     const quality = String(skill.quality || "MISS").toUpperCase();
     const type = quality === "MISS" ? "warn" : "skill";
-    const text = `${team} ${skill.skill} ${quality}`;
+    const action = skillToActionMap[skill.skill];
+    const actionLabel = action ? actionLabelMap[action] : skillDisplayName(skill.skill);
+    const scoreDelta = Number(skill.score_delta || 0);
+    const suffix = scoreDelta > 0 ? ` +${scoreDelta}` : "";
+    const text = `${team} ${actionLabel} ${quality}${suffix}`;
     pushEventLine(text, type);
   }
 }
@@ -472,7 +602,6 @@ function applyGameSnapshot(snapshot) {
   if (snapshot.game_result) {
     showResultModal(snapshot.game_result, snapshot.game_highlight || null);
   }
-  renderEventFeed();
   renderGameHud();
 }
 
@@ -515,42 +644,52 @@ function renderGameHud() {
   joinBEl.disabled = joinedTeam === "B";
 
   const phase = round.phase || "LOBBY";
-  const cooldowns = (player && player.cooldowns) || {};
   const playerEnergy = Number((player && player.energy) || 0);
-  for (const button of skillButtons) {
-    const skill = button.dataset.skill;
-    const cfg = skillCatalog.get(skill) || { energy_cost: 99, cooldown_ms: 0 };
-    const cooldownMs = Number(cooldowns[skill] || 0);
+  for (const view of actionViews) {
+    const { button, action, costEl, metaEl, skillEl, cooldownEl } = view;
+    const choice = resolveActionChoice(action, player);
     const canPlay =
       Boolean(joinedTeam) &&
       phase === "LIVE" &&
       !pendingAction &&
-      playerEnergy >= Number(cfg.energy_cost || 0) &&
-      cooldownMs <= 0;
+      Boolean(choice.skill) &&
+      playerEnergy >= Number(choice.energyCost || 0) &&
+      Number(choice.cooldownMs || 0) <= 0;
     button.classList.toggle("disabled", !canPlay);
-    button.classList.toggle("cooling", cooldownMs > 0);
+    button.classList.toggle("cooling", Number(choice.cooldownMs || 0) > 0);
     button.disabled = !canPlay;
 
-    const costEl = button.querySelector(".skill-cost");
     if (costEl) {
-      costEl.textContent = String(Number(cfg.energy_cost || 0));
+      costEl.textContent = String(Number(choice.energyCost || 0));
     }
-    const metaEl = button.querySelector(".skill-meta");
     if (metaEl) {
-      metaEl.textContent = skillLabelMap[skill] || "技能";
+      metaEl.textContent = actionMetaMap[action] || "自动择优";
     }
-    const cdEl = button.querySelector(".skill-cooldown");
-    if (cdEl) {
-      cdEl.textContent = cooldownMs > 0 ? `${(cooldownMs / 1000).toFixed(1)}s` : "";
+    if (skillEl) {
+      skillEl.textContent = `技能: ${choice.display}`;
     }
+    if (cooldownEl) {
+      cooldownEl.textContent = choice.cooldownMs > 0 ? `${(choice.cooldownMs / 1000).toFixed(1)}s` : "";
+    }
+  }
+
+  const hintAction = deriveHintAction();
+  if (windowHintEl) {
+    windowHintEl.textContent = hintAction
+      ? `窗口提示：${actionLabelMap[hintAction]} 命中率更高`
+      : "窗口提示：等待关键事件";
+  }
+  if (streakTextEl) {
+    streakTextEl.textContent = `连中 ${localHitStreak}`;
   }
 }
 
-function markSkillFeedback(skill, quality) {
-  const button = skillButtons.find((item) => item.dataset.skill === skill);
-  if (!button) {
+function markActionFeedback(action, quality) {
+  const view = actionViews.find((item) => item.action === action);
+  if (!view) {
     return;
   }
+  const { button } = view;
   button.classList.remove("feedback-perfect", "feedback-good", "feedback-miss");
   if (quality === "PERFECT") {
     button.classList.add("feedback-perfect");
@@ -596,16 +735,21 @@ async function joinTeam(team) {
     joinedTeam = team;
     applyGameSnapshot(payload.state || {});
     pushEventLine(`你加入了${teamNameMap[team]}阵营`, "skill");
-    renderEventFeed();
   } catch (error) {
     console.warn("join failed", error);
   }
 }
 
-async function triggerSkill(skill) {
+async function triggerAction(action) {
   if (!joinedTeam || pendingAction) {
     return;
   }
+  const choice = resolveActionChoice(action, gameView.player);
+  if (!choice.skill) {
+    pushEventLine("当前没有可触发技能", "warn");
+    return;
+  }
+
   pendingAction = true;
   renderGameHud();
   try {
@@ -614,7 +758,7 @@ async function triggerSkill(skill) {
       apiJsonOptions({
         user_id: localUserId,
         team: joinedTeam,
-        skill,
+        skill: choice.skill,
       })
     );
     if (!res.ok) {
@@ -624,8 +768,12 @@ async function triggerSkill(skill) {
     const payload = await res.json();
     if (payload.resolution) {
       const quality = String(payload.resolution.quality || "MISS").toUpperCase();
-      markSkillFeedback(skill, quality);
-      const message = payload.resolution.message || `${skill} ${quality}`;
+      markActionFeedback(action, quality);
+      updateLocalHitStreak(quality);
+      const qualityText = quality === "PERFECT" ? "完美命中" : quality === "GOOD" ? "命中" : "落空";
+      const scoreDelta = Number(payload.resolution.score_delta || 0);
+      const suffix = scoreDelta > 0 ? ` +${scoreDelta}` : "";
+      const message = `${actionLabelMap[action]} · ${choice.display} ${qualityText}${suffix}`;
       pushEventLine(message, quality === "MISS" ? "warn" : "skill");
     }
     if (payload.state) {
@@ -638,7 +786,6 @@ async function triggerSkill(skill) {
     pushEventLine("技能请求异常", "warn");
   } finally {
     pendingAction = false;
-    renderEventFeed();
     renderGameHud();
   }
 }
@@ -646,11 +793,10 @@ async function triggerSkill(skill) {
 function bindGameControls() {
   joinAEl.addEventListener("click", () => joinTeam("A"));
   joinBEl.addEventListener("click", () => joinTeam("B"));
-  for (const button of skillButtons) {
+  for (const { button, action } of actionViews) {
     button.addEventListener("click", () => {
-      const skill = button.dataset.skill;
-      if (skill) {
-        triggerSkill(skill);
+      if (action) {
+        triggerAction(action);
       }
     });
   }
@@ -687,9 +833,11 @@ function connect() {
   });
 
   socket.addEventListener("message", (event) => {
-    const data = JSON.parse(event.data);
-    latestSeq = data.seq || 0;
-    latestLatency = data.frame_ts_ms ? Date.now() - data.frame_ts_ms : 0;
+    const data = safeParseJson(event.data);
+    if (!data || typeof data !== "object") {
+      return;
+    }
+    latestSeq = Number(data.seq || 0);
     latestBackend = data.meta
       ? `${data.meta.detector}/${data.meta.tracker}/${data.meta.projector}`
       : "-";
@@ -701,6 +849,10 @@ function connect() {
     latestDetections = Array.isArray(data.detections) ? data.detections : [];
     latestTracks = Array.isArray(data.tracks) ? data.tracks : [];
     latestFrame = data.frame || latestFrame;
+    latestLatency =
+      latestFrame && Number.isFinite(latestFrame.source_ts_ms)
+        ? Math.max(0, Date.now() - Number(latestFrame.source_ts_ms))
+        : 0;
     pushOverlaySnapshot(data);
     syncVideoTimeToFrame(latestFrame);
 
@@ -1084,8 +1236,7 @@ function drawVideoOverlay() {
   overlayCtx.setLineDash([6, 4]);
   overlayCtx.lineWidth = 1.5;
   overlayCtx.strokeStyle = "rgba(255, 224, 87, 0.9)";
-  const detectionsToDraw = detections;
-  for (const det of detectionsToDraw) {
+  for (const det of detections) {
     const x = det.x * sx;
     const y = det.y * sy;
     const w = det.w * sx;
@@ -1096,8 +1247,7 @@ function drawVideoOverlay() {
   overlayCtx.setLineDash([]);
   overlayCtx.font = "12px sans-serif";
   overlayCtx.textBaseline = "top";
-  const tracksToDraw = tracks;
-  for (const track of tracksToDraw) {
+  for (const track of tracks) {
     const x = track.x * sx;
     const y = track.y * sy;
     const w = track.w * sx;
@@ -1311,30 +1461,7 @@ function collectRenderableEntities(now) {
     }
     active.push(e);
   }
-
-  if (active.length > 0) {
-    return active;
-  }
-
-  const sample = [];
-  for (let i = 0; i < 8; i += 1) {
-    const phase = now * 0.001 + i * 0.7;
-    sample.push({
-      id: 200 + i,
-      type: "player",
-      team: i % 2 === 0 ? "A" : "B",
-      x: pitchLength * 0.22 + (i % 4) * 18 + Math.sin(phase) * 1.7,
-      y: pitchWidth * 0.2 + Math.floor(i / 4) * 24 + Math.cos(phase * 0.8) * 1.2,
-    });
-  }
-  sample.push({
-    id: 1,
-    type: "ball",
-    team: "unknown",
-    x: pitchLength * 0.5 + Math.sin(now * 0.0012) * 4,
-    y: pitchWidth * 0.5 + Math.cos(now * 0.0011) * 2.3,
-  });
-  return sample;
+  return active;
 }
 
 function drawPanda(entity, camera, now) {
@@ -1567,7 +1694,7 @@ function drawPitchScene() {
 }
 
 function render(now = performance.now()) {
-  const overlayIntervalMs = isMobileDevice ? 33 : 33;
+  const overlayIntervalMs = 33;
   const pitchIntervalMs = isMobileDevice ? 42 : 28;
 
   if (now - lastOverlayRenderAt >= overlayIntervalMs) {
@@ -1586,7 +1713,7 @@ function render(now = performance.now()) {
 
 async function bootstrap() {
   bindGameControls();
-  renderEventFeed(true);
+  renderEventFeed();
   renderGameHud();
   await Promise.all([loadVideoPreview(), fetchGameState()]);
   connect();

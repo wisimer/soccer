@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Football MVP Replay</title>
+    <title>萌熊 vs 猴子 实时指挥战</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
@@ -58,42 +58,32 @@
           <div id="energyText" class="energy-text">能量 0 / 100</div>
         </div>
 
-        <div id="skillsGrid" class="skills-grid">
-          <button class="skill-card" data-skill="BoostPass">
-            <span class="skill-name">BoostPass</span>
-            <span class="skill-meta">传导强化</span>
-            <span class="skill-cost">16</span>
-            <span class="skill-cooldown"></span>
+        <div class="action-strip">
+          <div id="windowHint" class="window-hint">窗口提示：等待关键事件</div>
+          <div id="streakText" class="streak-text">连中 0</div>
+        </div>
+
+        <div id="actionGrid" class="actions-grid">
+          <button class="action-card attack" data-action="attack">
+            <span class="action-name">闪电进攻</span>
+            <span class="action-meta">自动择优：射门/传导</span>
+            <span class="action-skill">技能: ShotBuff</span>
+            <span class="action-cost">24</span>
+            <span class="action-cooldown"></span>
           </button>
-          <button class="skill-card" data-skill="StealAura">
-            <span class="skill-name">StealAura</span>
-            <span class="skill-meta">抢断气场</span>
-            <span class="skill-cost">20</span>
-            <span class="skill-cooldown"></span>
+          <button class="action-card defend" data-action="defend">
+            <span class="action-name">铜墙防守</span>
+            <span class="action-meta">自动择优：守门/抢断</span>
+            <span class="action-skill">技能: GoalGuard</span>
+            <span class="action-cost">22</span>
+            <span class="action-cooldown"></span>
           </button>
-          <button class="skill-card" data-skill="ShotBuff">
-            <span class="skill-name">ShotBuff</span>
-            <span class="skill-meta">射门增幅</span>
-            <span class="skill-cost">24</span>
-            <span class="skill-cooldown"></span>
-          </button>
-          <button class="skill-card" data-skill="GoalGuard">
-            <span class="skill-name">GoalGuard</span>
-            <span class="skill-meta">守门怒吼</span>
-            <span class="skill-cost">22</span>
-            <span class="skill-cooldown"></span>
-          </button>
-          <button class="skill-card" data-skill="ComboLock">
-            <span class="skill-name">ComboLock</span>
-            <span class="skill-meta">连击锁定</span>
-            <span class="skill-cost">26</span>
-            <span class="skill-cooldown"></span>
-          </button>
-          <button class="skill-card" data-skill="HypeRoar">
-            <span class="skill-name">HypeRoar</span>
-            <span class="skill-meta">全员狂热</span>
-            <span class="skill-cost">28</span>
-            <span class="skill-cooldown"></span>
+          <button class="action-card hype" data-action="hype">
+            <span class="action-name">狂热连击</span>
+            <span class="action-meta">自动择优：连击/狂热</span>
+            <span class="action-skill">技能: ComboLock</span>
+            <span class="action-cost">26</span>
+            <span class="action-cooldown"></span>
           </button>
         </div>
 
