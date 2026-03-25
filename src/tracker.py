@@ -13,104 +13,6 @@ class TrackerProtocol(Protocol):
     def update(self, detections: list[Detection], ts_ms: int) -> list[TrackState]: ...
 
 
-class NearestTracker:
-    name = "nearest"
-
-    def __init__(self, max_missed_frames: int = 8) -> None:
-        self._next_id = 1
-        self._tracks: dict[int, TrackState] = {}
-        self.max_missed_frames = max_missed_frames
-
-    def update(self, detections: list[Detection], ts_ms: int) -> list[TrackState]:
-        used_track_ids: set[int] = set()
-        assignments: dict[int, int] = {}
-        new_track_ids: set[int] = set()
-
-        for det_idx, det in enumerate(detections):
-            best_track_id = None
-            best_distance = float("inf")
-            det_x, det_y = det.foot_point if det.kind == "player" else det.center
-            base_gate = 90.0 if det.kind == "ball" else 70.0
-            max_extra_gate = 120.0 if det.kind == "ball" else 90.0
-
-            for track_id, track in self._tracks.items():
-                if track_id in used_track_ids:
-                    continue
-                if track.kind != det.kind:
-                    continue
-
-                dt_s = max((ts_ms - track.last_ts_ms) / 1000.0, 1e-3)
-                pred_dt = min(dt_s, 0.25)
-                pred_x = track.x_px + track.vx_px * pred_dt
-                pred_y = track.y_px + track.vy_px * pred_dt
-                speed = float(np.hypot(track.vx_px, track.vy_px))
-                dynamic_gate = base_gate + min(max_extra_gate, speed * pred_dt * 1.2 + track.missed_frames * 14.0)
-
-                distance = float(np.hypot(det_x - pred_x, det_y - pred_y))
-                if distance < best_distance and distance <= dynamic_gate:
-                    best_distance = distance
-                    best_track_id = track_id
-
-            if best_track_id is not None:
-                assignments[det_idx] = best_track_id
-                used_track_ids.add(best_track_id)
-
-        for det_idx, det in enumerate(detections):
-            det_x, det_y = det.foot_point if det.kind == "player" else det.center
-            if det_idx in assignments:
-                track = self._tracks[assignments[det_idx]]
-                dt_s = max((ts_ms - track.last_ts_ms) / 1000.0, 1e-3)
-                measured_vx = (det_x - track.x_px) / dt_s
-                measured_vy = (det_y - track.y_px) / dt_s
-                track.vx_px = 0.68 * measured_vx + 0.32 * track.vx_px
-                track.vy_px = 0.68 * measured_vy + 0.32 * track.vy_px
-                track.x_px = det_x
-                track.y_px = det_y
-                track.last_ts_ms = ts_ms
-                track.confidence = det.confidence
-                track.team = det.team or track.team
-                track.bbox_x = float(det.x)
-                track.bbox_y = float(det.y)
-                track.bbox_w = float(det.w)
-                track.bbox_h = float(det.h)
-                track.missed_frames = 0
-            else:
-                track_id = self._next_id
-                self._tracks[track_id] = TrackState(
-                    track_id=track_id,
-                    kind=det.kind,
-                    team=det.team or "unknown",
-                    x_px=det_x,
-                    y_px=det_y,
-                    vx_px=0.0,
-                    vy_px=0.0,
-                    confidence=det.confidence,
-                    last_ts_ms=ts_ms,
-                    bbox_x=float(det.x),
-                    bbox_y=float(det.y),
-                    bbox_w=float(det.w),
-                    bbox_h=float(det.h),
-                )
-                new_track_ids.add(track_id)
-                self._next_id += 1
-
-        matched_ids = set(assignments.values())
-        remove_ids: list[int] = []
-        for track_id, track in self._tracks.items():
-            if track_id in matched_ids:
-                continue
-            if track_id in new_track_ids:
-                continue
-            track.missed_frames += 1
-            if track.missed_frames > self.max_missed_frames:
-                remove_ids.append(track_id)
-
-        for track_id in remove_ids:
-            self._tracks.pop(track_id, None)
-
-        return [track for track in self._tracks.values() if track.missed_frames <= 1]
-
-
 class ByteTrackAdapter:
     """Thin wrapper around supervision.ByteTrack with TrackState outputs."""
 
@@ -139,6 +41,7 @@ class ByteTrackAdapter:
         )
         self._state_by_id: dict[int, TrackState] = {}
         self._max_missed_frames = max(8, track_buffer // 2)
+        self._visible_missed_frames = min(self._max_missed_frames, max(3, frame_rate // 5))
 
     def update(self, detections: list[Detection], ts_ms: int) -> list[TrackState]:
         if detections:
@@ -239,4 +142,6 @@ class ByteTrackAdapter:
             if state.missed_frames > self._max_missed_frames:
                 self._state_by_id.pop(track_id, None)
 
-        return [state for state in self._state_by_id.values() if state.missed_frames <= 1]
+        return [
+            state for state in self._state_by_id.values() if state.missed_frames <= self._visible_missed_frames
+        ]

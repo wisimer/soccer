@@ -21,11 +21,13 @@ from .runtime import (
     RuntimeSettings,
     build_decode_config,
     build_detector,
+    normalize_runtime_settings,
     build_postprocessor,
     build_projector,
     build_recorder,
     build_tracker,
     profile_defaults,
+    resolve_preferred_yolo_model,
     resolve_effective_profile,
 )
 
@@ -118,7 +120,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
 
         detector = build_detector(runtime_settings)
         tracker = build_tracker(runtime_settings)
-        projector = build_projector(runtime_settings)
+        projector = build_projector()
         decode_config = build_decode_config(runtime_settings)
         postprocessor = build_postprocessor(runtime_settings)
         recorder = build_recorder(runtime_settings)
@@ -146,15 +148,16 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         app.state.runtime = {
             "performance_profile": runtime_settings.performance_profile,
             "effective_profile": runtime_settings.effective_profile,
+            "target_fps": runtime_settings.target_fps,
             "detector": getattr(detector, "name", detector.__class__.__name__),
             "tracker": getattr(tracker, "name", tracker.__class__.__name__),
             "projector": getattr(projector, "name", projector.__class__.__name__),
-            "calibration_path": runtime_settings.calibration_path,
             "yolo_model": runtime_settings.yolo_model,
             "yolo_device": runtime_settings.yolo_device,
             "yolo_half": runtime_settings.yolo_half,
             "yolo_conf": runtime_settings.yolo_conf,
             "yolo_imgsz": runtime_settings.yolo_imgsz,
+            "track_buffer": runtime_settings.track_buffer,
             "decode_backend": runtime_settings.decode_backend,
             "decode_buffer_size": runtime_settings.decode_buffer_size,
             "decode_drop_policy": runtime_settings.decode_drop_policy,
@@ -383,7 +386,7 @@ def _resolve_str(
 def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
     requested_profile = str(args.profile or os.getenv("MVP_PROFILE", "auto")).lower()
     effective_profile = resolve_effective_profile(requested_profile)
-    profiled = {} if effective_profile == "custom" else profile_defaults(effective_profile)
+    profiled = profile_defaults(effective_profile)
 
     yolo_device = _resolve_str(args.yolo_device, profiled.get("yolo_device"), "MVP_YOLO_DEVICE", "cpu")
     yolo_half = _resolve_bool(args.yolo_half, profiled.get("yolo_half"), "MVP_YOLO_HALF", False)
@@ -399,13 +402,11 @@ def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
     if decode_backend not in ("opencv", "pyav"):
         decode_backend = "opencv"
 
-    return RuntimeSettings(
+    settings = RuntimeSettings(
         performance_profile=requested_profile,
         effective_profile=effective_profile,
-        detector_backend=args.detector,
-        tracker_backend=args.tracker,
-        calibration_path=args.calibration,
-        yolo_model=args.yolo_model,
+        target_fps=args.fps,
+        yolo_model=resolve_preferred_yolo_model(args.yolo_model),
         yolo_device=yolo_device,
         yolo_half=yolo_half,
         yolo_conf=_resolve_float(args.yolo_conf, profiled.get("yolo_conf"), "MVP_YOLO_CONF", 0.25),
@@ -431,6 +432,7 @@ def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
         reid_distance_px=args.reid_distance_px,
         record_path=args.record_path,
     )
+    return normalize_runtime_settings(settings)
 
 
 def _default_video_source() -> str:
@@ -442,8 +444,6 @@ def _default_video_source() -> str:
     if preferred.exists() and preferred.is_file():
         return str(preferred)
     return "0"
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Football stream MVP server")
     parser.add_argument(
@@ -457,28 +457,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--profile",
-        choices=["auto", "apple", "nvidia", "cpu", "custom"],
+        choices=["auto", "nvidia", "cpu"],
         default=os.getenv("MVP_PROFILE", "auto"),
         help="Performance profile: auto detect or force hardware-specific defaults",
     )
     parser.add_argument(
-        "--detector",
-        choices=["heuristic", "yolo"],
-        default=os.getenv("MVP_DETECTOR", "heuristic"),
-        help="Detector backend",
+        "--yolo-model",
+        default=resolve_preferred_yolo_model(os.getenv("MVP_YOLO_MODEL")),
     )
-    parser.add_argument(
-        "--tracker",
-        choices=["nearest", "bytetrack"],
-        default=os.getenv("MVP_TRACKER", "nearest"),
-        help="Tracker backend",
-    )
-    parser.add_argument(
-        "--calibration",
-        default=os.getenv("MVP_CALIBRATION"),
-        help="Path to homography calibration JSON",
-    )
-    parser.add_argument("--yolo-model", default=os.getenv("MVP_YOLO_MODEL", "yolov8n.pt"))
     parser.add_argument("--yolo-device", default=None)
     parser.add_argument("--yolo-half", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--yolo-conf", type=float, default=None)

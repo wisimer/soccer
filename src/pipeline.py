@@ -5,12 +5,12 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .detector import DetectorProtocol, HeuristicDetector
+from .detector import DetectorProtocol, YoloDetector
 from .game_engine import GameEngine
 from .postprocess import TrackPostProcessor
 from .projector import PITCH_LENGTH_M, PITCH_WIDTH_M, LinearProjector, ProjectorProtocol
 from .recorder import JsonlRecorder
-from .tracker import NearestTracker, TrackerProtocol
+from .tracker import ByteTrackAdapter, TrackerProtocol
 from .video_reader import BufferedVideoReader, DecodeConfig
 
 SCHEMA_VERSION = "1.5"
@@ -53,8 +53,8 @@ class StreamProcessor:
         self.source_arg = source
         self.target_fps = target_fps
         self.reconnect_sleep_s = reconnect_sleep_s
-        self.detector = detector or HeuristicDetector()
-        self.tracker = tracker or NearestTracker()
+        self.detector = detector or YoloDetector()
+        self.tracker = tracker or ByteTrackAdapter(frame_rate=target_fps)
         self.projector = projector or LinearProjector()
         self.reader = BufferedVideoReader(
             source=source,

@@ -5,9 +5,9 @@
 ## 当前能力
 
 1. 视频接入：摄像头 / 文件 / RTSP / HLS
-2. 检测：`heuristic` 或 `YOLO (ultralytics)`
-3. 跟踪：`nearest` 或 `ByteTrack (supervision)`
-4. 坐标映射：线性映射或单应矩阵
+2. 检测：`YOLO (ultralytics)`
+3. 跟踪：`ByteTrack (supervision)`
+4. 坐标映射：线性映射
 5. 轨迹后处理：EMA 平滑 + 短时 ReID（减少 ID 跳变）
 6. 解码稳态：解码线程与处理线程分离、可配置缓冲丢帧策略
 7. 数据闭环：JSONL 实时录制 + 离线评估脚本
@@ -21,14 +21,14 @@
 - `src/postprocess.py`: 轨迹平滑与短时 ReID
 - `src/recorder.py`: JSONL 录制器
 - `src/eval_replay.py`: 离线回放评估
-- `src/detector.py`: `HeuristicDetector` + `YoloDetector`
-- `src/tracker.py`: `NearestTracker` + `ByteTrackAdapter`
-- `src/projector.py`: `LinearProjector` + `HomographyProjector`
+- `src/detector.py`: `YoloDetector`
+- `src/tracker.py`: `ByteTrackAdapter`
+- `src/projector.py`: `LinearProjector`
 - `web/`: 前端可视化
 
 ## 安装
 
-基础依赖（可跑 MVP）：
+统一依赖：
 
 ```bash
 python3 -m venv .venv
@@ -36,28 +36,22 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-高级依赖（YOLO / ByteTrack / PyAV）：
-
-```bash
-pip install -r requirements-advanced.txt
-```
-
 ## 启动示例
 
-### 1) MVP（最小链路）
+### 1) 默认主链路
 
 ```bash
-python -m src.server --source 0 --fps 15 --detector heuristic --tracker nearest
+source .venv/bin/activate
+python -m src.server --source 0 --fps 15
 ```
 
 ### 2) 第二阶段主流链路（低延迟 + 稳定轨迹）
 
 ```bash
+source .venv/bin/activate
 python -m src.server \
   --source rtsp://user:pass@ip:554/stream \
   --fps 20 \
-  --detector yolo \
-  --tracker bytetrack \
   --decode-backend pyav \
   --decode-buffer-size 6 \
   --decode-drop-policy drop_oldest \
@@ -67,35 +61,23 @@ python -m src.server \
   --reid-distance-px 90
 ```
 
-### 3) 加单应矩阵坐标映射
-
-```bash
-python -m src.server \
-  --source ./data/match.mp4 \
-  --detector yolo \
-  --tracker bytetrack \
-  --calibration ./calibration/example_homography.json
-```
-
-### 4) 跨平台性能预设（Apple / NVIDIA）
+### 3) 跨平台性能预设（NVIDIA / CPU）
 
 自动识别本机加速器并应用推荐参数：
 
 ```bash
+source .venv/bin/activate
 python -m src.server \
   --source ./data/football.mp4 \
-  --detector yolo \
-  --tracker bytetrack \
   --profile auto
 ```
 
 手工指定（机器上有 NVIDIA GPU 时）：
 
 ```bash
+source .venv/bin/activate
 python -m src.server \
   --source ./data/football.mp4 \
-  --detector yolo \
-  --tracker bytetrack \
   --profile nvidia
 ```
 
@@ -106,22 +88,23 @@ python -m src.server \
 ### 录制
 
 ```bash
+source .venv/bin/activate
 python -m src.server \
   --source rtsp://user:pass@ip:554/stream \
-  --detector yolo \
-  --tracker bytetrack \
   --record-path ./runs/session-001.jsonl
 ```
 
 ### 评估
 
 ```bash
+source .venv/bin/activate
 python -m src.eval_replay --path ./runs/session-001.jsonl
 ```
 
 可输出 JSON：
 
 ```bash
+source .venv/bin/activate
 python -m src.eval_replay --path ./runs/session-001.jsonl --json
 ```
 
@@ -137,6 +120,7 @@ python -m src.eval_replay --path ./runs/session-001.jsonl --json
 ### 1) 仅准备数据（抽帧 + 划分，不训练）
 
 ```bash
+source .venv/bin/activate
 python -m src.train \
   --images-dir ./data/images \
   --videos-dir ./data/videos \
@@ -149,6 +133,7 @@ python -m src.train \
 ### 2) 直接训练
 
 ```bash
+source .venv/bin/activate
 python -m src.train \
   --images-dir ./data/images \
   --videos-dir ./data/videos \
@@ -169,10 +154,8 @@ python -m src.train \
 
 ## 关键参数
 
-- `--detector`: `heuristic | yolo`
-- `--tracker`: `nearest | bytetrack`
-- `--profile`: `auto | apple | nvidia | cpu | custom`
-- `--yolo-device`: 例如 `cpu | mps | cuda:0`
+- `--profile`: `auto | nvidia | cpu`
+- `--yolo-device`: 例如 `cpu | cuda:0`
 - `--yolo-half` / `--no-yolo-half`: 是否启用 FP16（仅 CUDA 生效）
 - `--yolo-conf`: YOLO 置信度阈值
 - `--yolo-imgsz`: YOLO 推理输入尺寸
@@ -186,36 +169,11 @@ python -m src.train \
 - `--reid-distance-px`: 短时 ReID 像素距离阈值
 - `--record-path`: JSONL 录制路径
 
-## 单应矩阵文件格式
-
-可直接参考模板：`calibration/example_homography.json`
-
-### 方式 A：直接提供 3x3 矩阵
-
-```json
-{
-  "homography": [
-    [0.0812, 0.0021, -13.42],
-    [-0.0017, 0.1023, -8.11],
-    [0.00001, 0.00002, 1.0]
-  ]
-}
-```
-
-### 方式 B：提供点对，运行时估计矩阵
-
-```json
-{
-  "image_points": [[120, 660], [1780, 640], [260, 210], [1640, 220]],
-  "pitch_points": [[0, 68], [105, 68], [0, 0], [105, 0]]
-}
-```
-
 ## 输出消息（节选）
 
 ```json
 {
-  "schema_version": "1.3",
+  "schema_version": "1.5",
   "seq": 123,
   "frame_ts_ms": 1739271234567,
   "entities": [
@@ -224,7 +182,7 @@ python -m src.train \
   "meta": {
     "detector": "yolo",
     "tracker": "bytetrack",
-    "projector": "homography",
+    "projector": "linear",
     "decode_backend": "pyav",
     "decode_buffered": 1,
     "decode_dropped": 42,

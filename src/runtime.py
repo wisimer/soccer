@@ -5,11 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .detector import DetectorProtocol, HeuristicDetector, YoloDetector
+from .detector import DetectorProtocol, YoloDetector
 from .postprocess import PostprocessConfig, TrackPostProcessor
-from .projector import HomographyProjector, LinearProjector, ProjectorProtocol
+from .projector import LinearProjector, ProjectorProtocol
 from .recorder import JsonlRecorder
-from .tracker import ByteTrackAdapter, NearestTracker, TrackerProtocol
+from .tracker import ByteTrackAdapter, TrackerProtocol
 from .video_reader import DecodeConfig
 
 logger = logging.getLogger(__name__)
@@ -19,9 +19,7 @@ logger = logging.getLogger(__name__)
 class RuntimeSettings:
     performance_profile: str = "auto"
     effective_profile: str = "cpu"
-    detector_backend: str = "heuristic"
-    tracker_backend: str = "nearest"
-    calibration_path: str | None = None
+    target_fps: int = 15
     yolo_model: str = "yolov8n.pt"
     yolo_device: str = "cpu"
     yolo_half: bool = False
@@ -39,6 +37,56 @@ class RuntimeSettings:
     record_path: str | None = None
 
 
+def resolve_preferred_yolo_model(explicit: str | None = None) -> str:
+    if explicit is not None:
+        stripped = str(explicit).strip()
+        if stripped:
+            return stripped
+
+    base_dir = Path(__file__).resolve().parents[1]
+    candidates = (
+        base_dir / "models" / "yolo-v8-football-players-best.pt",
+        base_dir / "yolov8n.pt",
+        base_dir / "yolo11n.pt",
+        base_dir / "yolo11s.pt",
+    )
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+    return "yolov8n.pt"
+
+
+def _clamp_float(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, float(value)))
+
+
+def normalize_runtime_settings(settings: RuntimeSettings) -> RuntimeSettings:
+    settings.target_fps = max(1, int(settings.target_fps))
+    settings.yolo_model = resolve_preferred_yolo_model(settings.yolo_model)
+    settings.yolo_conf = _clamp_float(settings.yolo_conf, 0.01, 0.95)
+    settings.yolo_imgsz = max(320, int(settings.yolo_imgsz))
+    settings.yolo_imgsz = max(32, (settings.yolo_imgsz // 32) * 32)
+    settings.track_buffer = max(8, int(settings.track_buffer))
+    settings.bytetrack_track_activation_threshold = _clamp_float(
+        settings.bytetrack_track_activation_threshold,
+        0.05,
+        0.95,
+    )
+    settings.decode_backend = str(settings.decode_backend).strip().lower()
+    if settings.decode_backend not in {"opencv", "pyav"}:
+        settings.decode_backend = "opencv"
+    settings.decode_buffer_size = max(1, int(settings.decode_buffer_size))
+    settings.decode_drop_policy = str(settings.decode_drop_policy).strip().lower()
+    if settings.decode_drop_policy not in {"drop_oldest", "drop_newest"}:
+        settings.decode_drop_policy = "drop_oldest"
+    settings.smooth_alpha = _clamp_float(settings.smooth_alpha, 0.0, 1.0)
+    settings.reid_ttl_ms = max(200, int(settings.reid_ttl_ms))
+    settings.reid_distance_px = max(1.0, float(settings.reid_distance_px))
+    if settings.yolo_half and not str(settings.yolo_device).lower().startswith("cuda"):
+        settings.yolo_half = False
+    return settings
+
+
 def detect_accelerators() -> tuple[bool, bool]:
     try:
         import torch
@@ -46,33 +94,20 @@ def detect_accelerators() -> tuple[bool, bool]:
         return (False, False)
 
     cuda = bool(torch.cuda.is_available())
-    mps = bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available())
-    return (cuda, mps)
+    return (cuda, False)
 
 
 def resolve_effective_profile(requested_profile: str) -> str:
     requested = (requested_profile or "auto").strip().lower()
-    cuda_available, mps_available = detect_accelerators()
-    if requested == "custom":
-        return "custom"
+    cuda_available, _ = detect_accelerators()
     if requested == "cpu":
         return "cpu"
     if requested == "nvidia":
         if cuda_available:
             return "nvidia"
-        if mps_available:
-            return "apple"
-        return "cpu"
-    if requested == "apple":
-        if mps_available:
-            return "apple"
-        if cuda_available:
-            return "nvidia"
         return "cpu"
     if cuda_available:
         return "nvidia"
-    if mps_available:
-        return "apple"
     return "cpu"
 
 
@@ -89,17 +124,8 @@ def profile_defaults(profile: str) -> dict[str, Any]:
             {
                 "yolo_device": "cuda:0",
                 "yolo_half": True,
-                "yolo_imgsz": 1280,
+                "yolo_imgsz": 768,
                 "decode_backend": "pyav",
-            }
-        )
-    elif normalized == "apple":
-        common.update(
-            {
-                "yolo_device": "mps",
-                "yolo_half": False,
-                "yolo_imgsz": 960,
-                "decode_backend": "opencv",
             }
         )
     elif normalized == "cpu":
@@ -116,66 +142,42 @@ def profile_defaults(profile: str) -> dict[str, Any]:
 
 
 def build_detector(settings: RuntimeSettings) -> DetectorProtocol:
-    backend = settings.detector_backend.lower()
-    if backend == "yolo":
-        try:
-            detector = YoloDetector(
-                model_path=settings.yolo_model,
-                device=settings.yolo_device,
-                confidence_threshold=settings.yolo_conf,
-                image_size=settings.yolo_imgsz,
-                use_half=settings.yolo_half,
-            )
-            logger.info(
-                "Detector backend: yolo (%s, device=%s, half=%s, conf=%s, imgsz=%s, profile=%s/%s)",
-                settings.yolo_model,
-                settings.yolo_device,
-                settings.yolo_half,
-                settings.yolo_conf,
-                settings.yolo_imgsz,
-                settings.performance_profile,
-                settings.effective_profile,
-            )
-            return detector
-        except Exception as exc:
-            logger.warning("YOLO unavailable, fallback to heuristic detector: %s", exc)
-
-    detector = HeuristicDetector()
-    logger.info("Detector backend: heuristic")
+    detector = YoloDetector(
+        model_path=settings.yolo_model,
+        device=settings.yolo_device,
+        confidence_threshold=settings.yolo_conf,
+        image_size=settings.yolo_imgsz,
+        use_half=settings.yolo_half,
+    )
+    logger.info(
+        "Detector backend: yolo (%s, device=%s, half=%s, conf=%s, imgsz=%s, profile=%s/%s)",
+        settings.yolo_model,
+        settings.yolo_device,
+        settings.yolo_half,
+        settings.yolo_conf,
+        settings.yolo_imgsz,
+        settings.performance_profile,
+        settings.effective_profile,
+    )
     return detector
 
 
 def build_tracker(settings: RuntimeSettings) -> TrackerProtocol:
-    backend = settings.tracker_backend.lower()
-    if backend == "bytetrack":
-        try:
-            tracker = ByteTrackAdapter(
-                track_buffer=settings.track_buffer,
-                track_activation_threshold=settings.bytetrack_track_activation_threshold,
-            )
-            logger.info("Tracker backend: bytetrack")
-            return tracker
-        except Exception as exc:
-            logger.warning("ByteTrack unavailable, fallback to nearest tracker: %s", exc)
-
-    tracker = NearestTracker(max_missed_frames=max(8, settings.track_buffer // 2))
-    logger.info("Tracker backend: nearest")
+    tracker = ByteTrackAdapter(
+        track_buffer=settings.track_buffer,
+        track_activation_threshold=settings.bytetrack_track_activation_threshold,
+        frame_rate=settings.target_fps,
+    )
+    logger.info(
+        "Tracker backend: bytetrack (buffer=%s, activation=%s, fps=%s)",
+        settings.track_buffer,
+        settings.bytetrack_track_activation_threshold,
+        settings.target_fps,
+    )
     return tracker
 
 
-def build_projector(settings: RuntimeSettings) -> ProjectorProtocol:
-    if settings.calibration_path:
-        calibration = Path(settings.calibration_path)
-        if calibration.exists():
-            try:
-                projector = HomographyProjector.from_json(calibration)
-                logger.info("Projector backend: homography (%s)", calibration)
-                return projector
-            except Exception as exc:
-                logger.warning("Failed to load calibration '%s': %s", calibration, exc)
-        else:
-            logger.warning("Calibration file not found: %s", calibration)
-
+def build_projector() -> ProjectorProtocol:
     projector = LinearProjector()
     logger.info("Projector backend: linear")
     return projector

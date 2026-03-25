@@ -9,6 +9,8 @@ from pathlib import Path
 
 import cv2
 
+from .runtime import resolve_preferred_yolo_model
+
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
@@ -141,8 +143,6 @@ def _auto_device() -> str:
 
     if torch.cuda.is_available():
         return "cuda:0"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
     return "cpu"
 
 
@@ -245,9 +245,7 @@ def run_training(args: argparse.Namespace, data_yaml_path: Path) -> None:
     try:
         from ultralytics import YOLO
     except ImportError as exc:
-        raise RuntimeError(
-            "ultralytics is not installed. Run `pip install -r requirements-advanced.txt`."
-        ) from exc
+        raise RuntimeError("ultralytics is not installed. Run `pip install -r requirements.txt`.") from exc
 
     device = args.device if args.device != "auto" else _auto_device()
     model = YOLO(args.model)
@@ -288,11 +286,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--classes-file", help="Optional text file, one class name per line")
     parser.add_argument("--prepare-only", action="store_true", help="Only prepare dataset; skip training")
 
-    parser.add_argument("--model", default="yolov8n.pt", help="Base model/weights for finetuning")
+    parser.add_argument("--model", default=resolve_preferred_yolo_model(), help="Base model/weights for finetuning")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--device", default="auto", help="auto/cpu/mps/cuda:0")
+    parser.add_argument("--device", default="auto", help="auto/cpu/cuda:0")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--project", default="./runs/train")
     parser.add_argument("--name", default="soccer-finetune")
