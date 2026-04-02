@@ -1,7 +1,57 @@
-gmc:
-  enabled: true
-  method: sparseOptFlow
-  downscale: 2.0
-  min_points: 12
-  motion_deadband_px: 1.0
-  max_translation_px: 80.0
+# Input source and decode behavior.
+input:
+  fps: 30
+  decode_backend: opencv
+  decode_buffer_size: 4
+  opencv_buffer_size: 2
+  decode_drop_policy: drop_oldest
+  reconnect_sleep_s: 2.0
+  prefer_latest_frame: true
+  record_path:
+
+# Detection and detector-side throughput tuning.
+detection:
+  yolo_model:
+  yolo_device:
+  yolo_half:
+  yolo_conf: 0.2
+  yolo_imgsz: 1280
+  yolo_batch_size: 1
+
+# Tracking and camera motion compensation.
+tracker:
+  track_buffer: 30
+  track_activation_threshold: 0.2
+  kalman_position_weight: 0.06
+  kalman_velocity_weight: 0.01125
+  gmc:
+    enabled: true
+    method: sparseOptFlow
+    downscale: 2.0
+    min_points: 12
+    motion_deadband_px: 1.0
+    max_translation_px: 80.0
+
+# Team classification. Set classification_mode to manual to pin jersey colors.
+team:
+  classification_mode: auto
+  team_a_primary_color: red
+  team_b_primary_color: blue
+  saturation_threshold: 45
+  min_color_ratio: 0.08
+
+# Trajectory smoothing and short-term re-identification.
+postprocess:
+  smooth_alpha: 0.35
+  ball_smooth_alpha: 0.68
+  fast_motion_px: 20.0
+  fast_motion_alpha: 0.9
+  max_prediction_dt_s: 0.25
+  ball_prediction_damping: 0.9
+  player_prediction_damping: 0.78
+  ball_confidence_decay: 0.97
+  player_confidence_decay: 0.93
+  reid_enabled: true
+  reid_ttl_ms: 1500
+  reid_distance_px: 85.0
+  reid_max_inactive_tracks: 256

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol
 
 import cv2
@@ -8,28 +9,117 @@ import numpy as np
 from .models import Detection
 
 
+@dataclass(frozen=True, slots=True)
+class TeamClassifierConfig:
+    mode: str = "auto"
+    team_a_primary_color: str = "red"
+    team_b_primary_color: str = "blue"
+    saturation_threshold: int = 45
+    min_color_ratio: float = 0.08
+
+
+_HUE_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
+    "red": ((0, 12), (168, 179)),
+    "orange": ((13, 24),),
+    "yellow": ((25, 38),),
+    "green": ((39, 84),),
+    "cyan": ((85, 99),),
+    "blue": ((100, 136),),
+    "purple": ((137, 167),),
+}
+
+_COLOR_ALIASES = {
+    "burgundy": "red",
+    "crimson": "red",
+    "maroon": "red",
+    "pink": "red",
+    "gold": "yellow",
+    "lime": "green",
+    "teal": "cyan",
+    "aqua": "cyan",
+    "skyblue": "cyan",
+    "navy": "blue",
+    "violet": "purple",
+    "grey": "white",
+    "gray": "white",
+    "dark": "black",
+}
+
+
 class DetectorProtocol(Protocol):
     name: str
 
     def detect(self, frame: np.ndarray) -> list[Detection]: ...
 
+    def detect_many(self, frames: list[np.ndarray]) -> list[list[Detection]]: ...
 
-def infer_team_from_bbox(frame: np.ndarray, x: int, y: int, w: int, h: int) -> str:
+
+def _normalize_color_name(value: str) -> str:
+    """Normalize user-supplied team color labels into canonical names."""
+
+    normalized = str(value or "").strip().lower().replace(" ", "").replace("-", "")
+    return _COLOR_ALIASES.get(normalized, normalized)
+
+
+def _team_color_ratio(hsv_roi: np.ndarray, color_name: str, saturation_threshold: int) -> float:
+    """Measure how much of the ROI matches the requested jersey color."""
+
+    if hsv_roi.size == 0:
+        return 0.0
+
+    color = _normalize_color_name(color_name)
+    sat = hsv_roi[:, :, 1]
+    val = hsv_roi[:, :, 2]
+    hue = hsv_roi[:, :, 0]
+
+    if color == "white":
+        mask = (sat <= 40) & (val >= 170)
+    elif color == "black":
+        mask = val <= 70
+    else:
+        ranges = _HUE_RANGES.get(color)
+        if not ranges:
+            return 0.0
+        hue_mask = np.zeros(hue.shape, dtype=bool)
+        for start, end in ranges:
+            hue_mask |= (hue >= start) & (hue <= end)
+        mask = hue_mask & (sat >= saturation_threshold)
+
+    return float(np.count_nonzero(mask)) / float(mask.size)
+
+
+def infer_team_from_bbox(
+    hsv_frame: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    config: TeamClassifierConfig | None = None,
+) -> str:
+    """Infer player team label from jersey color in the upper half of the box."""
+
+    team_config = config or TeamClassifierConfig()
     top = y
     bottom = y + max(1, h // 2)
     left = x
     right = x + w
-    roi = frame[top:bottom, left:right]
+    roi = hsv_frame[top:bottom, left:right]
     if roi.size == 0:
         return "unknown"
 
-    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    sat = hsv_roi[:, :, 1]
-    hue = hsv_roi[:, :, 0]
-    valid = sat > 45
+    if team_config.mode == "manual":
+        score_a = _team_color_ratio(roi, team_config.team_a_primary_color, team_config.saturation_threshold)
+        score_b = _team_color_ratio(roi, team_config.team_b_primary_color, team_config.saturation_threshold)
+        threshold = float(team_config.min_color_ratio)
+        if max(score_a, score_b) < threshold or abs(score_a - score_b) < 1e-6:
+            return "unknown"
+        return "A" if score_a > score_b else "B"
+
+    sat = roi[:, :, 1]
+    hue = roi[:, :, 0]
+    valid = sat > team_config.saturation_threshold
     if not np.any(valid):
         return "unknown"
-
     mean_hue = float(np.mean(hue[valid]))
     if mean_hue < 20 or mean_hue > 160:
         return "A"
@@ -50,6 +140,8 @@ class YoloDetector:
         confidence_threshold: float = 0.25,
         image_size: int = 1280,
         use_half: bool = False,
+        batch_size: int = 1,
+        team_config: TeamClassifierConfig | None = None,
     ) -> None:
         try:
             from ultralytics import YOLO
@@ -63,6 +155,8 @@ class YoloDetector:
         self.confidence_threshold = confidence_threshold
         self.image_size = image_size
         self.use_half = bool(use_half) and str(device).lower().startswith("cuda")
+        self.batch_size = max(1, int(batch_size))
+        self.team_config = team_config or TeamClassifierConfig()
         raw_names = getattr(self.model.model, "names", {}) or {}
         if isinstance(raw_names, dict):
             self.class_names: dict[int, str] = {int(k): str(v) for k, v in raw_names.items()}
@@ -70,15 +164,29 @@ class YoloDetector:
             self.class_names = {i: str(name) for i, name in enumerate(list(raw_names))}
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
-        result = self.model.predict(
-            source=frame,
+        """Run detection for a single frame."""
+
+        return self.detect_many([frame])[0]
+
+    def detect_many(self, frames: list[np.ndarray]) -> list[list[Detection]]:
+        """Run batched detection for one or more frames."""
+
+        if not frames:
+            return []
+
+        results = self.model.predict(
+            source=frames if len(frames) > 1 else frames[0],
             conf=self.confidence_threshold,
             imgsz=self.image_size,
             device=self.device,
             half=self.use_half,
+            batch=min(self.batch_size, len(frames)),
             verbose=False,
-        )[0]
+        )
 
+        return [self._build_detections(frame, result) for frame, result in zip(frames, results)]
+
+    def _build_detections(self, frame: np.ndarray, result: object) -> list[Detection]:
         detections: list[Detection] = []
         if result.boxes is None or len(result.boxes) == 0:
             return detections
@@ -88,6 +196,7 @@ class YoloDetector:
         cls = result.boxes.cls.cpu().numpy().astype(int)
 
         frame_h, frame_w = frame.shape[:2]
+        hsv_frame: np.ndarray | None = None
 
         for box, score, cls_id in zip(xyxy, conf, cls):
             class_name = self.class_names.get(cls_id, "")
@@ -106,7 +215,11 @@ class YoloDetector:
             if kind == "ball" and w * h > 3000:
                 continue
 
-            team = infer_team_from_bbox(frame, x1, y1, w, h) if kind == "player" else None
+            team = None
+            if kind == "player":
+                if hsv_frame is None:
+                    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                team = infer_team_from_bbox(hsv_frame, x1, y1, w, h, self.team_config)
             detections.append(
                 Detection(
                     kind=kind,

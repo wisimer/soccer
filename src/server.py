@@ -108,10 +108,79 @@ def _resolve_local_video_file(video_source: str, base_dir: Path) -> Path | None:
     return None
 
 
+def _video_preview_url(local_video_file: Path | None) -> str | None:
+    if local_video_file is None:
+        return None
+    return "/api/video"
+
+
+def _runtime_snapshot(
+    runtime_settings: RuntimeSettings,
+    detector: Any,
+    tracker: Any,
+    projector: Any,
+    local_video_file: Path | None,
+) -> dict[str, Any]:
+    preview_url = _video_preview_url(local_video_file)
+    return {
+        "performance_profile": runtime_settings.performance_profile,
+        "effective_profile": runtime_settings.effective_profile,
+        "target_fps": runtime_settings.target_fps,
+        "detector": getattr(detector, "name", detector.__class__.__name__),
+        "tracker": getattr(tracker, "name", tracker.__class__.__name__),
+        "projector": getattr(projector, "name", projector.__class__.__name__),
+        "yolo_model": runtime_settings.yolo_model,
+        "yolo_device": runtime_settings.yolo_device,
+        "yolo_half": runtime_settings.yolo_half,
+        "yolo_conf": runtime_settings.yolo_conf,
+        "yolo_imgsz": runtime_settings.yolo_imgsz,
+        "yolo_batch_size": runtime_settings.yolo_batch_size,
+        "track_buffer": runtime_settings.track_buffer,
+        "decode_backend": runtime_settings.decode_backend,
+        "decode_buffer_size": runtime_settings.decode_buffer_size,
+        "decode_opencv_buffer_size": runtime_settings.decode_opencv_buffer_size,
+        "decode_drop_policy": runtime_settings.decode_drop_policy,
+        "decode_reconnect_sleep_s": runtime_settings.decode_reconnect_sleep_s,
+        "bytetrack_track_activation_threshold": runtime_settings.bytetrack_track_activation_threshold,
+        "bytetrack_kalman_position_weight": runtime_settings.bytetrack_kalman_position_weight,
+        "bytetrack_kalman_velocity_weight": runtime_settings.bytetrack_kalman_velocity_weight,
+        "gmc_enabled": runtime_settings.gmc_enabled,
+        "gmc_method": runtime_settings.gmc_method,
+        "gmc_downscale": runtime_settings.gmc_downscale,
+        "gmc_min_points": runtime_settings.gmc_min_points,
+        "gmc_motion_deadband_px": runtime_settings.gmc_motion_deadband_px,
+        "gmc_max_translation_px": runtime_settings.gmc_max_translation_px,
+        "prefer_latest_frame": runtime_settings.prefer_latest_frame,
+        "team_classification_mode": runtime_settings.team_classification_mode,
+        "team_a_primary_color": runtime_settings.team_a_primary_color,
+        "team_b_primary_color": runtime_settings.team_b_primary_color,
+        "team_color_saturation_threshold": runtime_settings.team_color_saturation_threshold,
+        "team_color_min_ratio": runtime_settings.team_color_min_ratio,
+        "smooth_alpha": runtime_settings.smooth_alpha,
+        "ball_smooth_alpha": runtime_settings.ball_smooth_alpha,
+        "fast_motion_px": runtime_settings.fast_motion_px,
+        "fast_motion_alpha": runtime_settings.fast_motion_alpha,
+        "max_prediction_dt_s": runtime_settings.max_prediction_dt_s,
+        "ball_prediction_damping": runtime_settings.ball_prediction_damping,
+        "player_prediction_damping": runtime_settings.player_prediction_damping,
+        "ball_confidence_decay": runtime_settings.ball_confidence_decay,
+        "player_confidence_decay": runtime_settings.player_confidence_decay,
+        "reid_enabled": runtime_settings.reid_enabled,
+        "reid_ttl_ms": runtime_settings.reid_ttl_ms,
+        "reid_distance_px": runtime_settings.reid_distance_px,
+        "reid_max_inactive_tracks": runtime_settings.reid_max_inactive_tracks,
+        "record_path": runtime_settings.record_path,
+        "video_preview_url": preview_url,
+        "ws_schema_version": SCHEMA_VERSION,
+        "game_mode": "realtime-command-battle",
+    }
+
+
 def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSettings) -> FastAPI:
     base_dir = Path(__file__).resolve().parents[1]
     web_dir = base_dir / "web"
     local_video_file = _resolve_local_video_file(video_source, base_dir)
+    preview_url = _video_preview_url(local_video_file)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -129,6 +198,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         processor = StreamProcessor(
             source=video_source,
             target_fps=target_fps,
+            reconnect_sleep_s=runtime_settings.decode_reconnect_sleep_s,
             detector=detector,
             tracker=tracker,
             projector=projector,
@@ -146,40 +216,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         app.state.hub = hub
         app.state.game_engine = game_engine
         app.state.processor = processor
-        app.state.runtime = {
-            "performance_profile": runtime_settings.performance_profile,
-            "effective_profile": runtime_settings.effective_profile,
-            "target_fps": runtime_settings.target_fps,
-            "detector": getattr(detector, "name", detector.__class__.__name__),
-            "tracker": getattr(tracker, "name", tracker.__class__.__name__),
-            "projector": getattr(projector, "name", projector.__class__.__name__),
-            "yolo_model": runtime_settings.yolo_model,
-            "yolo_device": runtime_settings.yolo_device,
-            "yolo_half": runtime_settings.yolo_half,
-            "yolo_conf": runtime_settings.yolo_conf,
-            "yolo_imgsz": runtime_settings.yolo_imgsz,
-            "track_buffer": runtime_settings.track_buffer,
-            "decode_backend": runtime_settings.decode_backend,
-            "decode_buffer_size": runtime_settings.decode_buffer_size,
-            "decode_drop_policy": runtime_settings.decode_drop_policy,
-            "bytetrack_track_activation_threshold": runtime_settings.bytetrack_track_activation_threshold,
-            "bytetrack_kalman_position_weight": runtime_settings.bytetrack_kalman_position_weight,
-            "bytetrack_kalman_velocity_weight": runtime_settings.bytetrack_kalman_velocity_weight,
-            "gmc_enabled": runtime_settings.gmc_enabled,
-            "gmc_method": runtime_settings.gmc_method,
-            "gmc_downscale": runtime_settings.gmc_downscale,
-            "gmc_min_points": runtime_settings.gmc_min_points,
-            "gmc_motion_deadband_px": runtime_settings.gmc_motion_deadband_px,
-            "gmc_max_translation_px": runtime_settings.gmc_max_translation_px,
-            "prefer_latest_frame": runtime_settings.prefer_latest_frame,
-            "smooth_alpha": runtime_settings.smooth_alpha,
-            "reid_ttl_ms": runtime_settings.reid_ttl_ms,
-            "reid_distance_px": runtime_settings.reid_distance_px,
-            "record_path": runtime_settings.record_path,
-            "video_preview_url": "/api/video" if local_video_file is not None else None,
-            "ws_schema_version": SCHEMA_VERSION,
-            "game_mode": "realtime-command-battle",
-        }
+        app.state.runtime = _runtime_snapshot(runtime_settings, detector, tracker, projector, local_video_file)
 
         try:
             yield
@@ -201,7 +238,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         return {
             "status": "ok",
             "video_source": video_source,
-            "video_preview_url": "/api/video" if local_video_file is not None else None,
+            "video_preview_url": preview_url,
             "target_fps": target_fps,
             "runtime": app.state.runtime,
             "clients": await app.state.hub.size(),
@@ -330,65 +367,77 @@ def _env_str(name: str) -> str | None:
 
 def _resolve_bool(
     explicit: bool | None,
+    yaml_value: Any,
     profiled: Any,
     env_name: str,
     hard_default: bool,
 ) -> bool:
     if explicit is not None:
         return bool(explicit)
-    if profiled is not None:
-        return bool(profiled)
     env_val = _env_bool(env_name)
     if env_val is not None:
         return env_val
+    if yaml_value is not None:
+        return bool(yaml_value)
+    if profiled is not None:
+        return bool(profiled)
     return hard_default
 
 
 def _resolve_float(
     explicit: float | None,
+    yaml_value: Any,
     profiled: Any,
     env_name: str,
     hard_default: float,
 ) -> float:
     if explicit is not None:
         return float(explicit)
-    if profiled is not None:
-        return float(profiled)
     env_val = _env_float(env_name)
     if env_val is not None:
         return float(env_val)
+    if yaml_value is not None:
+        return float(yaml_value)
+    if profiled is not None:
+        return float(profiled)
     return hard_default
 
 
 def _resolve_int(
     explicit: int | None,
+    yaml_value: Any,
     profiled: Any,
     env_name: str,
     hard_default: int,
 ) -> int:
     if explicit is not None:
         return int(explicit)
-    if profiled is not None:
-        return int(profiled)
     env_val = _env_int(env_name)
     if env_val is not None:
         return int(env_val)
+    if yaml_value is not None:
+        return int(yaml_value)
+    if profiled is not None:
+        return int(profiled)
     return hard_default
 
 
 def _resolve_str(
     explicit: str | None,
+    yaml_value: Any,
     profiled: Any,
     env_name: str,
     hard_default: str,
 ) -> str:
     if explicit is not None:
         return str(explicit)
-    if profiled is not None:
-        return str(profiled)
     env_val = _env_str(env_name)
     if env_val is not None:
         return env_val
+    if yaml_value is not None:
+        return str(yaml_value)
+    if profiled is not None:
+        return str(profiled)
     return hard_default
 
 
@@ -402,20 +451,48 @@ def _load_runtime_yaml() -> dict[str, Any]:
     return {}
 
 
+def _config_section(config: dict[str, Any], name: str) -> dict[str, Any]:
+    section = config.get(name)
+    if isinstance(section, dict):
+        return section
+    return {}
+
+
 def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
+    """Resolve CLI, env, profile, and YAML into runtime settings."""
+
     requested_profile = str(args.profile or os.getenv("MVP_PROFILE", "auto")).lower()
     effective_profile = resolve_effective_profile(requested_profile)
     profiled = profile_defaults(effective_profile)
     yaml_config = _load_runtime_yaml()
-    gmc_config = yaml_config.get("gmc") if isinstance(yaml_config.get("gmc"), dict) else {}
+    input_config = _config_section(yaml_config, "input")
+    detection_config = _config_section(yaml_config, "detection")
+    tracker_config = _config_section(yaml_config, "tracker")
+    team_config = _config_section(yaml_config, "team")
+    postprocess_config = _config_section(yaml_config, "postprocess")
+    legacy_gmc_config = yaml_config.get("gmc") if isinstance(yaml_config.get("gmc"), dict) else {}
+    gmc_config = _config_section(tracker_config, "gmc") or legacy_gmc_config
 
-    yolo_device = _resolve_str(args.yolo_device, profiled.get("yolo_device"), "MVP_YOLO_DEVICE", "cpu")
-    yolo_half = _resolve_bool(args.yolo_half, profiled.get("yolo_half"), "MVP_YOLO_HALF", False)
+    yolo_device = _resolve_str(
+        args.yolo_device,
+        detection_config.get("yolo_device"),
+        profiled.get("yolo_device"),
+        "MVP_YOLO_DEVICE",
+        "cpu",
+    )
+    yolo_half = _resolve_bool(
+        args.yolo_half,
+        detection_config.get("yolo_half"),
+        profiled.get("yolo_half"),
+        "MVP_YOLO_HALF",
+        False,
+    )
     if yolo_half and not yolo_device.lower().startswith("cuda"):
         yolo_half = False
 
     decode_backend = _resolve_str(
         args.decode_backend,
+        input_config.get("decode_backend"),
         profiled.get("decode_backend"),
         "MVP_DECODE_BACKEND",
         "opencv",
@@ -426,27 +503,51 @@ def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
     settings = RuntimeSettings(
         performance_profile=requested_profile,
         effective_profile=effective_profile,
-        target_fps=args.fps,
-        yolo_model=resolve_preferred_yolo_model(args.yolo_model),
+        target_fps=_resolve_int(args.fps, input_config.get("fps"), None, "MVP_FPS", 30),
+        yolo_model=resolve_preferred_yolo_model(
+            _resolve_str(args.yolo_model, detection_config.get("yolo_model"), None, "MVP_YOLO_MODEL", "")
+        ),
         yolo_device=yolo_device,
         yolo_half=yolo_half,
-        yolo_conf=_resolve_float(args.yolo_conf, profiled.get("yolo_conf"), "MVP_YOLO_CONF", 0.25),
-        yolo_imgsz=_resolve_int(args.yolo_imgsz, profiled.get("yolo_imgsz"), "MVP_YOLO_IMGSZ", 1280),
-        track_buffer=args.track_buffer,
+        yolo_conf=_resolve_float(
+            args.yolo_conf,
+            detection_config.get("yolo_conf"),
+            profiled.get("yolo_conf"),
+            "MVP_YOLO_CONF",
+            0.25,
+        ),
+        yolo_imgsz=_resolve_int(
+            args.yolo_imgsz,
+            detection_config.get("yolo_imgsz"),
+            profiled.get("yolo_imgsz"),
+            "MVP_YOLO_IMGSZ",
+            1280,
+        ),
+        yolo_batch_size=_resolve_int(
+            args.yolo_batch_size,
+            detection_config.get("yolo_batch_size"),
+            profiled.get("yolo_batch_size"),
+            "MVP_YOLO_BATCH_SIZE",
+            1,
+        ),
+        track_buffer=_resolve_int(args.track_buffer, tracker_config.get("track_buffer"), None, "MVP_TRACK_BUFFER", 30),
         bytetrack_track_activation_threshold=_resolve_float(
             args.bytetrack_track_activation_threshold,
+            tracker_config.get("track_activation_threshold"),
             profiled.get("bytetrack_track_activation_threshold"),
             "MVP_BYTETRACK_TRACK_ACTIVATION_THRESHOLD",
             0.25,
         ),
         bytetrack_kalman_position_weight=_resolve_float(
             args.bytetrack_kalman_position_weight,
+            tracker_config.get("kalman_position_weight"),
             profiled.get("bytetrack_kalman_position_weight"),
             "MVP_BYTETRACK_KALMAN_POSITION_WEIGHT",
             0.06,
         ),
         bytetrack_kalman_velocity_weight=_resolve_float(
             args.bytetrack_kalman_velocity_weight,
+            tracker_config.get("kalman_velocity_weight"),
             profiled.get("bytetrack_kalman_velocity_weight"),
             "MVP_BYTETRACK_KALMAN_VELOCITY_WEIGHT",
             0.01125,
@@ -454,57 +555,215 @@ def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
         gmc_enabled=_resolve_bool(
             args.gmc_enabled,
             gmc_config.get("enabled"),
+            profiled.get("gmc_enabled"),
             "MVP_GMC_ENABLED",
             True,
         ),
         gmc_method=_resolve_str(
             args.gmc_method,
             gmc_config.get("method"),
+            profiled.get("gmc_method"),
             "MVP_GMC_METHOD",
             "sparseOptFlow",
         ),
         gmc_downscale=_resolve_float(
             args.gmc_downscale,
             gmc_config.get("downscale"),
+            profiled.get("gmc_downscale"),
             "MVP_GMC_DOWNSCALE",
             2.0,
         ),
         gmc_min_points=_resolve_int(
             args.gmc_min_points,
             gmc_config.get("min_points"),
+            profiled.get("gmc_min_points"),
             "MVP_GMC_MIN_POINTS",
             12,
         ),
         gmc_motion_deadband_px=_resolve_float(
             args.gmc_motion_deadband_px,
             gmc_config.get("motion_deadband_px"),
+            profiled.get("gmc_motion_deadband_px"),
             "MVP_GMC_MOTION_DEADBAND_PX",
             1.0,
         ),
         gmc_max_translation_px=_resolve_float(
             args.gmc_max_translation_px,
             gmc_config.get("max_translation_px"),
+            profiled.get("gmc_max_translation_px"),
             "MVP_GMC_MAX_TRANSLATION_PX",
             80.0,
         ),
         decode_backend=decode_backend,
-        decode_buffer_size=args.decode_buffer_size,
-        decode_drop_policy=args.decode_drop_policy,
+        decode_buffer_size=_resolve_int(
+            args.decode_buffer_size,
+            input_config.get("decode_buffer_size"),
+            None,
+            "MVP_DECODE_BUFFER_SIZE",
+            8,
+        ),
+        decode_opencv_buffer_size=_resolve_int(
+            getattr(args, "decode_opencv_buffer_size", None),
+            input_config.get("opencv_buffer_size"),
+            profiled.get("decode_opencv_buffer_size"),
+            "MVP_DECODE_OPENCV_BUFFER_SIZE",
+            2,
+        ),
+        decode_drop_policy=_resolve_str(
+            args.decode_drop_policy,
+            input_config.get("decode_drop_policy"),
+            None,
+            "MVP_DECODE_DROP_POLICY",
+            "drop_oldest",
+        ),
+        decode_reconnect_sleep_s=_resolve_float(
+            getattr(args, "decode_reconnect_sleep_s", None),
+            input_config.get("reconnect_sleep_s"),
+            None,
+            "MVP_DECODE_RECONNECT_SLEEP_S",
+            2.0,
+        ),
         prefer_latest_frame=_resolve_bool(
             args.prefer_latest_frame,
+            input_config.get("prefer_latest_frame"),
             profiled.get("prefer_latest_frame"),
             "MVP_PREFER_LATEST_FRAME",
             True,
         ),
-        smooth_alpha=args.smooth_alpha,
-        reid_ttl_ms=args.reid_ttl_ms,
-        reid_distance_px=args.reid_distance_px,
-        record_path=args.record_path,
+        team_classification_mode=_resolve_str(
+            args.team_classification_mode,
+            team_config.get("classification_mode"),
+            None,
+            "MVP_TEAM_CLASSIFICATION_MODE",
+            "auto",
+        ),
+        team_a_primary_color=_resolve_str(
+            args.team_a_primary_color,
+            team_config.get("team_a_primary_color"),
+            None,
+            "MVP_TEAM_A_PRIMARY_COLOR",
+            "red",
+        ),
+        team_b_primary_color=_resolve_str(
+            args.team_b_primary_color,
+            team_config.get("team_b_primary_color"),
+            None,
+            "MVP_TEAM_B_PRIMARY_COLOR",
+            "blue",
+        ),
+        team_color_saturation_threshold=_resolve_int(
+            getattr(args, "team_color_saturation_threshold", None),
+            team_config.get("saturation_threshold"),
+            None,
+            "MVP_TEAM_COLOR_SATURATION_THRESHOLD",
+            45,
+        ),
+        team_color_min_ratio=_resolve_float(
+            getattr(args, "team_color_min_ratio", None),
+            team_config.get("min_color_ratio"),
+            None,
+            "MVP_TEAM_COLOR_MIN_RATIO",
+            0.08,
+        ),
+        smooth_alpha=_resolve_float(
+            args.smooth_alpha,
+            postprocess_config.get("smooth_alpha"),
+            None,
+            "MVP_SMOOTH_ALPHA",
+            0.35,
+        ),
+        ball_smooth_alpha=_resolve_float(
+            getattr(args, "ball_smooth_alpha", None),
+            postprocess_config.get("ball_smooth_alpha"),
+            None,
+            "MVP_BALL_SMOOTH_ALPHA",
+            0.68,
+        ),
+        fast_motion_px=_resolve_float(
+            getattr(args, "fast_motion_px", None),
+            postprocess_config.get("fast_motion_px"),
+            None,
+            "MVP_FAST_MOTION_PX",
+            20.0,
+        ),
+        fast_motion_alpha=_resolve_float(
+            getattr(args, "fast_motion_alpha", None),
+            postprocess_config.get("fast_motion_alpha"),
+            None,
+            "MVP_FAST_MOTION_ALPHA",
+            0.9,
+        ),
+        max_prediction_dt_s=_resolve_float(
+            getattr(args, "max_prediction_dt_s", None),
+            postprocess_config.get("max_prediction_dt_s"),
+            None,
+            "MVP_MAX_PREDICTION_DT_S",
+            0.25,
+        ),
+        ball_prediction_damping=_resolve_float(
+            getattr(args, "ball_prediction_damping", None),
+            postprocess_config.get("ball_prediction_damping"),
+            None,
+            "MVP_BALL_PREDICTION_DAMPING",
+            0.9,
+        ),
+        player_prediction_damping=_resolve_float(
+            getattr(args, "player_prediction_damping", None),
+            postprocess_config.get("player_prediction_damping"),
+            None,
+            "MVP_PLAYER_PREDICTION_DAMPING",
+            0.78,
+        ),
+        ball_confidence_decay=_resolve_float(
+            getattr(args, "ball_confidence_decay", None),
+            postprocess_config.get("ball_confidence_decay"),
+            None,
+            "MVP_BALL_CONFIDENCE_DECAY",
+            0.97,
+        ),
+        player_confidence_decay=_resolve_float(
+            getattr(args, "player_confidence_decay", None),
+            postprocess_config.get("player_confidence_decay"),
+            None,
+            "MVP_PLAYER_CONFIDENCE_DECAY",
+            0.93,
+        ),
+        reid_ttl_ms=_resolve_int(
+            args.reid_ttl_ms,
+            postprocess_config.get("reid_ttl_ms"),
+            None,
+            "MVP_REID_TTL_MS",
+            1500,
+        ),
+        reid_distance_px=_resolve_float(
+            args.reid_distance_px,
+            postprocess_config.get("reid_distance_px"),
+            None,
+            "MVP_REID_DISTANCE_PX",
+            85.0,
+        ),
+        reid_enabled=_resolve_bool(
+            getattr(args, "reid_enabled", None),
+            postprocess_config.get("reid_enabled"),
+            profiled.get("reid_enabled"),
+            "MVP_REID_ENABLED",
+            True,
+        ),
+        reid_max_inactive_tracks=_resolve_int(
+            getattr(args, "reid_max_inactive_tracks", None),
+            postprocess_config.get("reid_max_inactive_tracks"),
+            profiled.get("reid_max_inactive_tracks"),
+            "MVP_REID_MAX_INACTIVE_TRACKS",
+            256,
+        ),
+        record_path=_resolve_str(args.record_path, input_config.get("record_path"), None, "MVP_RECORD_PATH", ""),
     )
     return normalize_runtime_settings(settings)
 
 
 def _default_video_source() -> str:
+    """Return the preferred default local test clip when available."""
+
     env_source = os.getenv("MVP_VIDEO_SOURCE")
     if env_source:
         return env_source
@@ -513,14 +772,18 @@ def _default_video_source() -> str:
     if preferred.exists() and preferred.is_file():
         return str(preferred)
     return "0"
+
+
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the server process."""
+
     parser = argparse.ArgumentParser(description="Football stream MVP server")
     parser.add_argument(
         "--source",
         default=_default_video_source(),
         help="RTSP/HLS URL, video file path, or camera index (default: local test clip if present, else 0)",
     )
-    parser.add_argument("--fps", type=int, default=int(os.getenv("MVP_FPS", "30")), help="Processing FPS")
+    parser.add_argument("--fps", type=int, default=None, help="Processing FPS")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=int(os.getenv("MVP_PORT", "8765")))
 
@@ -532,13 +795,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--yolo-model",
-        default=resolve_preferred_yolo_model(os.getenv("MVP_YOLO_MODEL")),
+        default=None,
     )
     parser.add_argument("--yolo-device", default=None)
     parser.add_argument("--yolo-half", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--yolo-conf", type=float, default=None)
     parser.add_argument("--yolo-imgsz", type=int, default=None)
-    parser.add_argument("--track-buffer", type=int, default=int(os.getenv("MVP_TRACK_BUFFER", "30")))
+    parser.add_argument("--yolo-batch-size", type=int, default=None)
+    parser.add_argument("--track-buffer", type=int, default=None)
     parser.add_argument("--bytetrack-track-activation-threshold", type=float, default=None)
     parser.add_argument(
         "--bytetrack-kalman-position-weight",
@@ -586,14 +850,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decode-buffer-size",
         type=int,
-        default=int(os.getenv("MVP_DECODE_BUFFER_SIZE", "8")),
+        default=None,
         help="Decoder frame buffer size",
+    )
+    parser.add_argument(
+        "--decode-opencv-buffer-size",
+        type=int,
+        default=None,
+        help="OpenCV capture buffer size for network streams",
     )
     parser.add_argument(
         "--decode-drop-policy",
         choices=["drop_oldest", "drop_newest"],
-        default=os.getenv("MVP_DECODE_DROP_POLICY", "drop_oldest"),
+        default=None,
         help="Buffer full strategy",
+    )
+    parser.add_argument(
+        "--decode-reconnect-sleep-s",
+        type=float,
+        default=None,
+        help="Reconnect backoff in seconds after decoder errors",
     )
     parser.add_argument(
         "--prefer-latest-frame",
@@ -602,26 +878,51 @@ def parse_args() -> argparse.Namespace:
         help="Prefer newest frame to reduce latency",
     )
     parser.add_argument(
+        "--team-classification-mode",
+        choices=["auto", "manual"],
+        default=None,
+        help="Auto infer jersey colors or use configured team primary colors",
+    )
+    parser.add_argument("--team-a-primary-color", default=None)
+    parser.add_argument("--team-b-primary-color", default=None)
+    parser.add_argument("--team-color-saturation-threshold", type=int, default=None)
+    parser.add_argument("--team-color-min-ratio", type=float, default=None)
+    parser.add_argument(
         "--smooth-alpha",
         type=float,
-        default=float(os.getenv("MVP_SMOOTH_ALPHA", "0.35")),
+        default=None,
         help="EMA smoothing alpha [0,1]",
     )
+    parser.add_argument("--ball-smooth-alpha", type=float, default=None)
+    parser.add_argument("--fast-motion-px", type=float, default=None)
+    parser.add_argument("--fast-motion-alpha", type=float, default=None)
+    parser.add_argument("--max-prediction-dt-s", type=float, default=None)
+    parser.add_argument("--ball-prediction-damping", type=float, default=None)
+    parser.add_argument("--player-prediction-damping", type=float, default=None)
+    parser.add_argument("--ball-confidence-decay", type=float, default=None)
+    parser.add_argument("--player-confidence-decay", type=float, default=None)
+    parser.add_argument("--reid-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
         "--reid-ttl-ms",
         type=int,
-        default=int(os.getenv("MVP_REID_TTL_MS", "1500")),
+        default=None,
         help="Short-term re-identification TTL in milliseconds",
     )
     parser.add_argument(
         "--reid-distance-px",
         type=float,
-        default=float(os.getenv("MVP_REID_DISTANCE_PX", "85.0")),
+        default=None,
         help="Max pixel distance for short-term re-identification",
     )
     parser.add_argument(
+        "--reid-max-inactive-tracks",
+        type=int,
+        default=None,
+        help="Maximum inactive track states kept for short-term re-identification",
+    )
+    parser.add_argument(
         "--record-path",
-        default=os.getenv("MVP_RECORD_PATH"),
+        default=None,
         help="Optional JSONL output path for payload recording",
     )
     parser.add_argument("--log-level", default=os.getenv("MVP_LOG_LEVEL", "info"))
@@ -640,7 +941,7 @@ def main() -> None:
     runtime_settings = build_runtime_settings(args)
     app = create_app(
         video_source=str(args.source),
-        target_fps=int(args.fps),
+        target_fps=runtime_settings.target_fps,
         runtime_settings=runtime_settings,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level=str(args.log_level).lower())

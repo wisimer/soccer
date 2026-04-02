@@ -17,6 +17,8 @@ SCHEMA_VERSION = "1.5"
 
 
 def _fallback_bbox(kind: str, x_px: float, y_px: float) -> tuple[float, float, float, float]:
+    """Build a conservative fallback box when tracker output lacks bbox data."""
+
     if kind == "ball":
         size = 10.0
         return (x_px - size / 2.0, y_px - size / 2.0, size, size)
@@ -24,6 +26,17 @@ def _fallback_bbox(kind: str, x_px: float, y_px: float) -> tuple[float, float, f
     width = 24.0
     height = 52.0
     return (x_px - width / 2.0, y_px - height, width, height)
+
+
+def _track_bbox(track: Any) -> tuple[float, float, float, float]:
+    if track.bbox_x is None or track.bbox_y is None or track.bbox_w is None or track.bbox_h is None:
+        return _fallback_bbox(track.kind, track.x_px, track.y_px)
+    return (
+        float(track.bbox_x),
+        float(track.bbox_y),
+        float(track.bbox_w),
+        float(track.bbox_h),
+    )
 
 
 @dataclass(slots=True)
@@ -71,11 +84,99 @@ class StreamProcessor:
         self._continuity = _ContinuityState()
         self._last_ball_entity: dict[str, Any] | None = None
         self._last_ball_track: dict[str, Any] | None = None
+        self._last_projector_shape: tuple[int, int] | None = None
 
     def stop(self) -> None:
+        """Request the processing loop to stop."""
+
         self.running = False
 
+    def _serialize_detection(self, detection: Any) -> dict[str, Any]:
+        return {
+            "type": detection.kind,
+            "team": detection.team or "unknown",
+            "x": int(detection.x),
+            "y": int(detection.y),
+            "w": int(detection.w),
+            "h": int(detection.h),
+            "conf": round(float(detection.confidence), 3),
+        }
+
+    def _serialize_track(self, track: Any) -> tuple[dict[str, Any], dict[str, Any], tuple[float, float, float, float]]:
+        bbox_x, bbox_y, bbox_w, bbox_h = _track_bbox(track)
+        x_m, y_m = self.projector.to_pitch(track.x_px, track.y_px)
+        vx_m, vy_m = self.projector.velocity_to_pitch(
+            track.x_px,
+            track.y_px,
+            track.vx_px,
+            track.vy_px,
+        )
+        entity_item = {
+            "id": track.track_id,
+            "type": track.kind,
+            "team": track.team,
+            "x": round(x_m, 2),
+            "y": round(y_m, 2),
+            "vx": round(vx_m, 2),
+            "vy": round(vy_m, 2),
+            "conf": round(float(track.confidence), 3),
+        }
+        track_item = {
+            "id": track.track_id,
+            "type": track.kind,
+            "team": track.team,
+            "x": round(float(bbox_x), 2),
+            "y": round(float(bbox_y), 2),
+            "w": round(float(max(1.0, bbox_w)), 2),
+            "h": round(float(max(1.0, bbox_h)), 2),
+            "conf": round(float(track.confidence), 3),
+        }
+        return entity_item, track_item, (bbox_x, bbox_y, bbox_w, bbox_h)
+
+    def _remember_ball(self, track: Any, entity_item: dict[str, Any], bbox: tuple[float, float, float, float]) -> None:
+        _, _, bbox_w, bbox_h = bbox
+        self._last_ball_entity = dict(entity_item)
+        self._last_ball_track = {
+            "id": track.track_id,
+            "team": track.team,
+            "center_x": float(track.x_px),
+            "center_y": float(track.y_px),
+            "vx_px": float(track.vx_px),
+            "vy_px": float(track.vy_px),
+            "w": float(max(1.0, bbox_w)),
+            "h": float(max(1.0, bbox_h)),
+            "conf": float(track.confidence),
+        }
+
+    def _build_meta(
+        self,
+        packet: Any,
+        detect_ms_per_frame: float,
+        track_ms: float,
+        post_ms: float,
+        decode_stats: dict[str, Any],
+        detect_batch_size: int,
+    ) -> dict[str, Any]:
+        return {
+            "detector": getattr(self.detector, "name", self.detector.__class__.__name__),
+            "tracker": getattr(self.tracker, "name", self.tracker.__class__.__name__),
+            "projector": getattr(self.projector, "name", self.projector.__class__.__name__),
+            "detect_ms": round(detect_ms_per_frame, 2),
+            "track_ms": round(track_ms, 2),
+            "post_ms": round(post_ms, 2),
+            "process_ms": round(detect_ms_per_frame + track_ms + post_ms, 2),
+            "decode_backend": decode_stats.get("backend"),
+            "decode_buffered": decode_stats.get("buffered_frames", 0),
+            "decode_dropped": decode_stats.get("dropped_frames", 0),
+            "decode_reconnects": decode_stats.get("reconnects", 0),
+            "capture_ts_ms": packet.capture_ts_ms,
+            "frame_index": packet.frame_index,
+            "detect_batch_size": detect_batch_size,
+        }
+
     def _estimate_continuity(self, tracks: list[Any], ts_ms: int) -> dict[str, Any]:
+        """Estimate short-horizon tracking continuity health metrics."""
+
         has_ball = any(getattr(track, "kind", "") == "ball" for track in tracks)
         if has_ball:
             self._continuity.last_ball_seen_ms = ts_ms
@@ -132,6 +233,8 @@ class StreamProcessor:
         track_payload: list[dict[str, Any]],
         ts_ms: int,
     ) -> None:
+        """Inject a short-lived predicted ball when detections temporarily disappear."""
+
         if any(item.get("type") == "ball" for item in entities):
             return
         if self._continuity.last_ball_seen_ms is None:
@@ -176,167 +279,114 @@ class StreamProcessor:
             )
 
     async def run(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        """Run the end-to-end streaming pipeline and publish payloads."""
+
         min_interval_s = 1.0 / max(1, self.target_fps)
+        detect_batch_size = max(1, int(getattr(self.detector, "batch_size", 1)))
         last_emit_perf = 0.0
         self.reader.start()
 
         try:
             while self.running:
-                packet = await asyncio.to_thread(
-                    self.reader.pop_frame,
+                if last_emit_perf > 0.0:
+                    wait_s = min_interval_s - (time.perf_counter() - last_emit_perf)
+                    if wait_s > 0:
+                        await asyncio.sleep(wait_s)
+                packets = await asyncio.to_thread(
+                    self.reader.pop_frames,
+                    detect_batch_size,
                     1.0,
                     self.prefer_latest_frame,
                 )
-                if packet is None:
+                if not packets:
                     continue
-
-                now_perf = time.perf_counter()
-                if now_perf - last_emit_perf < min_interval_s:
-                    continue
-                last_emit_perf = now_perf
-
-                frame = packet.frame
-                frame_height, frame_width = frame.shape[:2]
-                self.projector.update(frame_width, frame_height)
-
-                process_ts_ms = int(time.time() * 1000)
-                frame_ts_ms = packet.source_ts_ms if packet.source_ts_ms is not None else packet.capture_ts_ms
 
                 t0 = time.perf_counter()
-                detections = await asyncio.to_thread(self.detector.detect, frame)
+                frames = [packet.frame for packet in packets]
+                detections_batch = await asyncio.to_thread(self.detector.detect_many, frames)
                 t1 = time.perf_counter()
-                raw_tracks = await asyncio.to_thread(self.tracker.update, detections, process_ts_ms, frame)
-                t2 = time.perf_counter()
-                tracks = await asyncio.to_thread(self.postprocessor.update, raw_tracks, process_ts_ms)
-                t3 = time.perf_counter()
+                detect_ms_per_frame = ((t1 - t0) * 1000.0) / max(1, len(packets))
+                last_emit_perf = t1
 
-                detection_payload = [
-                    {
-                        "type": det.kind,
-                        "team": det.team or "unknown",
-                        "x": int(det.x),
-                        "y": int(det.y),
-                        "w": int(det.w),
-                        "h": int(det.h),
-                        "conf": round(float(det.confidence), 3),
-                    }
-                    for det in detections
-                ]
+                for packet, detections in zip(packets, detections_batch):
+                    frame = packet.frame
+                    frame_height, frame_width = frame.shape[:2]
+                    shape = (frame_width, frame_height)
+                    if self._last_projector_shape != shape:
+                        self.projector.update(frame_width, frame_height)
+                        self._last_projector_shape = shape
 
-                entities: list[dict[str, Any]] = []
-                track_payload: list[dict[str, Any]] = []
-                for track in tracks:
-                    x_m, y_m = self.projector.to_pitch(track.x_px, track.y_px)
-                    vx_m, vy_m = self.projector.velocity_to_pitch(
-                        track.x_px,
-                        track.y_px,
-                        track.vx_px,
-                        track.vy_px,
+                    process_ts_ms = int(time.time() * 1000)
+                    frame_ts_ms = packet.source_ts_ms if packet.source_ts_ms is not None else packet.capture_ts_ms
+
+                    t2 = time.perf_counter()
+                    raw_tracks = await asyncio.to_thread(self.tracker.update, detections, process_ts_ms, frame)
+                    t3 = time.perf_counter()
+                    tracks = await asyncio.to_thread(self.postprocessor.update, raw_tracks, process_ts_ms)
+                    t4 = time.perf_counter()
+
+                    detection_payload = [self._serialize_detection(det) for det in detections]
+
+                    entities: list[dict[str, Any]] = []
+                    track_payload: list[dict[str, Any]] = []
+                    for track in tracks:
+                        entity_item, track_item, bbox = self._serialize_track(track)
+                        entities.append(entity_item)
+                        track_payload.append(track_item)
+
+                        if track.kind == "ball":
+                            self._remember_ball(track, entity_item, bbox)
+
+                    continuity_health = self._estimate_continuity(tracks, process_ts_ms)
+                    self._apply_ball_continuity(entities, track_payload, process_ts_ms)
+                    game_payload = self.game_engine.update_from_frame(
+                        entities=entities,
+                        ts_ms=process_ts_ms,
+                        continuity_health=continuity_health,
                     )
-                    entity_item = {
-                        "id": track.track_id,
-                        "type": track.kind,
-                        "team": track.team,
-                        "x": round(x_m, 2),
-                        "y": round(y_m, 2),
-                        "vx": round(vx_m, 2),
-                        "vy": round(vy_m, 2),
-                        "conf": round(float(track.confidence), 3),
+
+                    decode_stats = self.reader.stats()
+                    track_ms = (t3 - t2) * 1000.0
+                    post_ms = (t4 - t3) * 1000.0
+                    payload = {
+                        "schema_version": SCHEMA_VERSION,
+                        "seq": self.seq,
+                        "frame_ts_ms": frame_ts_ms,
+                        "frame": {
+                            "width": frame_width,
+                            "height": frame_height,
+                            "index": packet.frame_index,
+                            "source_ts_ms": packet.source_ts_ms,
+                            "capture_ts_ms": packet.capture_ts_ms,
+                        },
+                        "pitch": {
+                            "length_m": PITCH_LENGTH_M,
+                            "width_m": PITCH_WIDTH_M,
+                        },
+                        "detections": detection_payload,
+                        "tracks": track_payload,
+                        "entities": entities,
+                        **game_payload,
+                        "meta": self._build_meta(
+                            packet=packet,
+                            detect_ms_per_frame=detect_ms_per_frame,
+                            track_ms=track_ms,
+                            post_ms=post_ms,
+                            decode_stats=decode_stats,
+                            detect_batch_size=len(packets),
+                        ),
                     }
-                    entities.append(entity_item)
-                    if (
-                        track.bbox_x is None
-                        or track.bbox_y is None
-                        or track.bbox_w is None
-                        or track.bbox_h is None
-                    ):
-                        bbox_x, bbox_y, bbox_w, bbox_h = _fallback_bbox(track.kind, track.x_px, track.y_px)
-                    else:
-                        bbox_x = track.bbox_x
-                        bbox_y = track.bbox_y
-                        bbox_w = track.bbox_w
-                        bbox_h = track.bbox_h
-                    track_item = {
-                        "id": track.track_id,
-                        "type": track.kind,
-                        "team": track.team,
-                        "x": round(float(bbox_x), 2),
-                        "y": round(float(bbox_y), 2),
-                        "w": round(float(max(1.0, bbox_w)), 2),
-                        "h": round(float(max(1.0, bbox_h)), 2),
-                        "conf": round(float(track.confidence), 3),
-                    }
-                    track_payload.append(track_item)
+                    self.seq += 1
 
-                    if track.kind == "ball":
-                        self._last_ball_entity = dict(entity_item)
-                        self._last_ball_track = {
-                            "id": track.track_id,
-                            "team": track.team,
-                            "center_x": float(track.x_px),
-                            "center_y": float(track.y_px),
-                            "vx_px": float(track.vx_px),
-                            "vy_px": float(track.vy_px),
-                            "w": float(max(1.0, bbox_w)),
-                            "h": float(max(1.0, bbox_h)),
-                            "conf": float(track.confidence),
-                        }
+                    if self.recorder is not None:
+                        self.recorder.write(payload)
 
-                continuity_health = self._estimate_continuity(tracks, process_ts_ms)
-                self._apply_ball_continuity(entities, track_payload, process_ts_ms)
-                game_payload = self.game_engine.update_from_frame(
-                    entities=entities,
-                    ts_ms=process_ts_ms,
-                    continuity_health=continuity_health,
-                )
-
-                decode_stats = self.reader.stats()
-                payload = {
-                    "schema_version": SCHEMA_VERSION,
-                    "seq": self.seq,
-                    "frame_ts_ms": frame_ts_ms,
-                    "frame": {
-                        "width": frame_width,
-                        "height": frame_height,
-                        "index": packet.frame_index,
-                        "source_ts_ms": packet.source_ts_ms,
-                        "capture_ts_ms": packet.capture_ts_ms,
-                    },
-                    "pitch": {
-                        "length_m": PITCH_LENGTH_M,
-                        "width_m": PITCH_WIDTH_M,
-                    },
-                    "detections": detection_payload,
-                    "tracks": track_payload,
-                    "entities": entities,
-                    **game_payload,
-                    "meta": {
-                        "detector": getattr(self.detector, "name", self.detector.__class__.__name__),
-                        "tracker": getattr(self.tracker, "name", self.tracker.__class__.__name__),
-                        "projector": getattr(self.projector, "name", self.projector.__class__.__name__),
-                        "detect_ms": round((t1 - t0) * 1000.0, 2),
-                        "track_ms": round((t2 - t1) * 1000.0, 2),
-                        "post_ms": round((t3 - t2) * 1000.0, 2),
-                        "process_ms": round((t3 - t0) * 1000.0, 2),
-                        "decode_backend": decode_stats.get("backend"),
-                        "decode_buffered": decode_stats.get("buffered_frames", 0),
-                        "decode_dropped": decode_stats.get("dropped_frames", 0),
-                        "decode_reconnects": decode_stats.get("reconnects", 0),
-                        "capture_ts_ms": packet.capture_ts_ms,
-                        "frame_index": packet.frame_index,
-                    },
-                }
-                self.seq += 1
-
-                if self.recorder is not None:
-                    self.recorder.write(payload)
-
-                if queue.full():
-                    try:
-                        queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                await queue.put(payload)
+                    if queue.full():
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                    await queue.put(payload)
         finally:
             self.reader.stop()
             if self.recorder is not None:

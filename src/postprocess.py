@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import numpy as np
@@ -12,6 +13,8 @@ class PostprocessConfig:
     smooth_alpha: float = 0.35
     reid_ttl_ms: int = 1500
     reid_distance_px: float = 85.0
+    reid_enabled: bool = True
+    reid_max_inactive_tracks: int = 256
     ball_smooth_alpha: float = 0.68
     fast_motion_px: float = 20.0
     fast_motion_alpha: float = 0.9
@@ -30,9 +33,11 @@ class TrackPostProcessor:
         self._next_stable_id = 1
         self._raw_to_stable: dict[int, int] = {}
         self._stable_state: dict[int, TrackState] = {}
-        self._inactive: dict[int, TrackState] = {}
+        self._inactive: OrderedDict[int, TrackState] = OrderedDict()
 
     def update(self, tracks: list[TrackState], ts_ms: int) -> list[TrackState]:
+        """Smooth active tracks and optionally reconnect short-lived ID breaks."""
+
         active_raw_ids = {track.track_id for track in tracks}
 
         for raw_id in list(self._raw_to_stable.keys()):
@@ -40,8 +45,8 @@ class TrackPostProcessor:
                 continue
             stable_id = self._raw_to_stable.pop(raw_id)
             prev_state = self._stable_state.get(stable_id)
-            if prev_state is not None:
-                self._inactive[stable_id] = prev_state
+            if prev_state is not None and self.config.reid_enabled:
+                self._remember_inactive(stable_id, prev_state)
 
         self._purge_inactive(ts_ms)
 
@@ -59,11 +64,12 @@ class TrackPostProcessor:
         if raw_id in self._raw_to_stable:
             return self._raw_to_stable[raw_id]
 
-        matched_stable = self._match_inactive(observed, ts_ms)
-        if matched_stable is not None:
-            self._raw_to_stable[raw_id] = matched_stable
-            self._inactive.pop(matched_stable, None)
-            return matched_stable
+        if self.config.reid_enabled:
+            matched_stable = self._match_inactive(observed, ts_ms)
+            if matched_stable is not None:
+                self._raw_to_stable[raw_id] = matched_stable
+                self._inactive.pop(matched_stable, None)
+                return matched_stable
 
         stable_id = self._next_stable_id
         self._next_stable_id += 1
@@ -104,6 +110,14 @@ class TrackPostProcessor:
                 best_distance = distance
 
         return best_id
+
+    def _remember_inactive(self, stable_id: int, state: TrackState) -> None:
+        self._inactive[stable_id] = state
+        self._inactive.move_to_end(stable_id)
+        limit = max(1, int(self.config.reid_max_inactive_tracks))
+        while len(self._inactive) > limit:
+            expired_id, _ = self._inactive.popitem(last=False)
+            self._stable_state.pop(expired_id, None)
 
     def _smooth(self, stable_id: int, observed: TrackState, ts_ms: int) -> TrackState:
         prev = self._stable_state.get(stable_id)

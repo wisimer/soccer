@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 class DecodeConfig:
     backend: str = "opencv"
     buffer_size: int = 8
+    opencv_buffer_size: int = 2
     drop_policy: str = "drop_oldest"
 
 
@@ -52,6 +53,8 @@ class BufferedVideoReader:
         self._backend_used = self.config.backend.lower()
 
     def start(self) -> None:
+        """Start the decoder worker thread."""
+
         if self._thread is not None and self._thread.is_alive():
             return
         self._running = True
@@ -59,6 +62,8 @@ class BufferedVideoReader:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop the decoder worker thread."""
+
         self._running = False
         with self._condition:
             self._condition.notify_all()
@@ -66,25 +71,46 @@ class BufferedVideoReader:
             self._thread.join(timeout=2.0)
 
     def pop_frame(self, timeout_s: float = 1.0, prefer_latest: bool = True) -> FramePacket | None:
+        """Pop a single buffered frame packet."""
+
+        packets = self.pop_frames(max_frames=1, timeout_s=timeout_s, prefer_latest=prefer_latest)
+        if not packets:
+            return None
+        return packets[0]
+
+    def pop_frames(
+        self,
+        max_frames: int = 1,
+        timeout_s: float = 1.0,
+        prefer_latest: bool = True,
+    ) -> list[FramePacket]:
+        """Pop one or more buffered frames for downstream batch processing."""
+
         deadline = time.time() + max(0.0, timeout_s)
+        batch_size = max(1, int(max_frames))
         with self._condition:
             while self._running and not self._buffer:
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    return None
+                    return []
                 self._condition.wait(timeout=remaining)
 
             if not self._buffer:
-                return None
+                return []
 
             if prefer_latest:
-                packet = self._buffer[-1]
+                packets = list(self._buffer)[-batch_size:]
                 self._buffer.clear()
-            else:
-                packet = self._buffer.popleft()
-            return packet
+                return packets
+
+            packets: list[FramePacket] = []
+            while self._buffer and len(packets) < batch_size:
+                packets.append(self._buffer.popleft())
+            return packets
 
     def stats(self) -> dict[str, Any]:
+        """Return decoder runtime counters."""
+
         with self._condition:
             buffered = len(self._buffer)
         return {
@@ -119,20 +145,21 @@ class BufferedVideoReader:
             time.sleep(self.reconnect_sleep_s)
 
     def _decode_with_opencv(self) -> None:
+        source_is_file = self._looks_like_file()
         capture = cv2.VideoCapture(self._resolve_source())
         if not capture.isOpened():
             logger.warning("failed to open source with OpenCV: %s", self.source_arg)
             return
+        self._configure_opencv_capture(capture, source_is_file)
 
         frame_idx = 0
         loop_start_wall: float | None = None
         loop_start_source_ms: int | None = None
-        source_is_file = self._looks_like_file()
         try:
             while self._running:
                 ok, frame = capture.read()
                 if not ok:
-                    if self._looks_like_file():
+                    if source_is_file:
                         capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         time.sleep(0.01)
                         continue
@@ -142,15 +169,11 @@ class BufferedVideoReader:
                 ts_pos = capture.get(cv2.CAP_PROP_POS_MSEC)
                 source_ts_ms = int(ts_pos) if ts_pos > 0 else None
                 if source_is_file and source_ts_ms is not None:
-                    if loop_start_source_ms is None or loop_start_wall is None or source_ts_ms < loop_start_source_ms:
-                        loop_start_source_ms = source_ts_ms
-                        loop_start_wall = time.perf_counter()
-                    else:
-                        expected_elapsed_s = max(0.0, (source_ts_ms - loop_start_source_ms) / 1000.0)
-                        actual_elapsed_s = max(0.0, time.perf_counter() - loop_start_wall)
-                        sleep_s = expected_elapsed_s - actual_elapsed_s
-                        if sleep_s > 0:
-                            time.sleep(min(sleep_s, 0.2))
+                    loop_start_wall, loop_start_source_ms = self._pace_local_file(
+                        source_ts_ms,
+                        loop_start_wall,
+                        loop_start_source_ms,
+                    )
                 packet = FramePacket(
                     frame=frame,
                     source_ts_ms=source_ts_ms,
@@ -160,6 +183,14 @@ class BufferedVideoReader:
                 self._push(packet)
         finally:
             capture.release()
+
+    def _configure_opencv_capture(self, capture: cv2.VideoCapture, source_is_file: bool) -> None:
+        if source_is_file:
+            return
+        try:
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, max(1, int(self.config.opencv_buffer_size)))
+        except Exception:
+            logger.debug("OpenCV backend does not expose CAP_PROP_BUFFERSIZE for source: %s", self.source_arg)
 
     def _decode_with_pyav(self) -> None:
         import av
@@ -193,15 +224,11 @@ class BufferedVideoReader:
                     source_ts_ms = int(float(frame.time) * 1000) if frame.time is not None else None
                     frame_idx += 1
                     if source_is_file and source_ts_ms is not None:
-                        if loop_start_source_ms is None or loop_start_wall is None or source_ts_ms < loop_start_source_ms:
-                            loop_start_source_ms = source_ts_ms
-                            loop_start_wall = time.perf_counter()
-                        else:
-                            expected_elapsed_s = max(0.0, (source_ts_ms - loop_start_source_ms) / 1000.0)
-                            actual_elapsed_s = max(0.0, time.perf_counter() - loop_start_wall)
-                            sleep_s = expected_elapsed_s - actual_elapsed_s
-                            if sleep_s > 0:
-                                time.sleep(min(sleep_s, 0.2))
+                        loop_start_wall, loop_start_source_ms = self._pace_local_file(
+                            source_ts_ms,
+                            loop_start_wall,
+                            loop_start_source_ms,
+                        )
                     packet = FramePacket(
                         frame=arr,
                         source_ts_ms=source_ts_ms,
@@ -235,6 +262,22 @@ class BufferedVideoReader:
             self._buffer.append(packet)
             self._decoded_frames += 1
             self._condition.notify_all()
+
+    @staticmethod
+    def _pace_local_file(
+        source_ts_ms: int,
+        loop_start_wall: float | None,
+        loop_start_source_ms: int | None,
+    ) -> tuple[float, int]:
+        if loop_start_source_ms is None or loop_start_wall is None or source_ts_ms < loop_start_source_ms:
+            return (time.perf_counter(), source_ts_ms)
+
+        expected_elapsed_s = max(0.0, (source_ts_ms - loop_start_source_ms) / 1000.0)
+        actual_elapsed_s = max(0.0, time.perf_counter() - loop_start_wall)
+        sleep_s = expected_elapsed_s - actual_elapsed_s
+        if sleep_s > 0:
+            time.sleep(min(sleep_s, 0.2))
+        return (loop_start_wall, loop_start_source_ms)
 
     def _resolve_source(self) -> str | int:
         if self.source_arg.isdigit():
