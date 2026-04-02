@@ -148,6 +148,57 @@ class StreamProcessor:
             "conf": float(track.confidence),
         }
 
+    def _serialize_tracks_payload(
+        self,
+        tracks: list[Any],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        entities: list[dict[str, Any]] = []
+        track_payload: list[dict[str, Any]] = []
+        for track in tracks:
+            entity_item, track_item, bbox = self._serialize_track(track)
+            entities.append(entity_item)
+            track_payload.append(track_item)
+            if track.kind == "ball":
+                self._remember_ball(track, entity_item, bbox)
+        return entities, track_payload
+
+    def _frame_payload(self, packet: Any, frame_width: int, frame_height: int) -> dict[str, Any]:
+        return {
+            "width": frame_width,
+            "height": frame_height,
+            "index": packet.frame_index,
+            "source_ts_ms": packet.source_ts_ms,
+            "capture_ts_ms": packet.capture_ts_ms,
+        }
+
+    def _build_payload(
+        self,
+        packet: Any,
+        frame_width: int,
+        frame_height: int,
+        frame_ts_ms: int,
+        detection_payload: list[dict[str, Any]],
+        track_payload: list[dict[str, Any]],
+        entities: list[dict[str, Any]],
+        game_payload: dict[str, Any],
+        meta: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "seq": self.seq,
+            "frame_ts_ms": frame_ts_ms,
+            "frame": self._frame_payload(packet, frame_width, frame_height),
+            "pitch": {
+                "length_m": PITCH_LENGTH_M,
+                "width_m": PITCH_WIDTH_M,
+            },
+            "detections": detection_payload,
+            "tracks": track_payload,
+            "entities": entities,
+            **game_payload,
+            "meta": meta,
+        }
+
     def _build_meta(
         self,
         packet: Any,
@@ -326,16 +377,7 @@ class StreamProcessor:
                     t4 = time.perf_counter()
 
                     detection_payload = [self._serialize_detection(det) for det in detections]
-
-                    entities: list[dict[str, Any]] = []
-                    track_payload: list[dict[str, Any]] = []
-                    for track in tracks:
-                        entity_item, track_item, bbox = self._serialize_track(track)
-                        entities.append(entity_item)
-                        track_payload.append(track_item)
-
-                        if track.kind == "ball":
-                            self._remember_ball(track, entity_item, bbox)
+                    entities, track_payload = self._serialize_tracks_payload(tracks)
 
                     continuity_health = self._estimate_continuity(tracks, process_ts_ms)
                     self._apply_ball_continuity(entities, track_payload, process_ts_ms)
@@ -348,34 +390,25 @@ class StreamProcessor:
                     decode_stats = self.reader.stats()
                     track_ms = (t3 - t2) * 1000.0
                     post_ms = (t4 - t3) * 1000.0
-                    payload = {
-                        "schema_version": SCHEMA_VERSION,
-                        "seq": self.seq,
-                        "frame_ts_ms": frame_ts_ms,
-                        "frame": {
-                            "width": frame_width,
-                            "height": frame_height,
-                            "index": packet.frame_index,
-                            "source_ts_ms": packet.source_ts_ms,
-                            "capture_ts_ms": packet.capture_ts_ms,
-                        },
-                        "pitch": {
-                            "length_m": PITCH_LENGTH_M,
-                            "width_m": PITCH_WIDTH_M,
-                        },
-                        "detections": detection_payload,
-                        "tracks": track_payload,
-                        "entities": entities,
-                        **game_payload,
-                        "meta": self._build_meta(
-                            packet=packet,
-                            detect_ms_per_frame=detect_ms_per_frame,
-                            track_ms=track_ms,
-                            post_ms=post_ms,
-                            decode_stats=decode_stats,
-                            detect_batch_size=len(packets),
-                        ),
-                    }
+                    meta = self._build_meta(
+                        packet=packet,
+                        detect_ms_per_frame=detect_ms_per_frame,
+                        track_ms=track_ms,
+                        post_ms=post_ms,
+                        decode_stats=decode_stats,
+                        detect_batch_size=len(packets),
+                    )
+                    payload = self._build_payload(
+                        packet=packet,
+                        frame_width=frame_width,
+                        frame_height=frame_height,
+                        frame_ts_ms=frame_ts_ms,
+                        detection_payload=detection_payload,
+                        track_payload=track_payload,
+                        entities=entities,
+                        game_payload=game_payload,
+                        meta=meta,
+                    )
                     self.seq += 1
 
                     if self.recorder is not None:
