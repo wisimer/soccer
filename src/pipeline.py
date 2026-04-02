@@ -38,7 +38,7 @@ class StreamProcessor:
     def __init__(
         self,
         source: str,
-        target_fps: int = 15,
+        target_fps: int = 30,
         reconnect_sleep_s: float = 2.0,
         detector: DetectorProtocol | None = None,
         tracker: TrackerProtocol | None = None,

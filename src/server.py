@@ -101,7 +101,7 @@ def _resolve_local_video_file(video_source: str, base_dir: Path) -> Path | None:
         candidates.append(Path.cwd() / raw_path)
 
     for candidate in candidates:
-        candidate = candidate.resolve()
+        candidate = candidate.expanduser()
         if candidate.exists() and candidate.is_file():
             return candidate
     return None
@@ -162,6 +162,8 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
             "decode_buffer_size": runtime_settings.decode_buffer_size,
             "decode_drop_policy": runtime_settings.decode_drop_policy,
             "bytetrack_track_activation_threshold": runtime_settings.bytetrack_track_activation_threshold,
+            "bytetrack_kalman_position_weight": runtime_settings.bytetrack_kalman_position_weight,
+            "bytetrack_kalman_velocity_weight": runtime_settings.bytetrack_kalman_velocity_weight,
             "prefer_latest_frame": runtime_settings.prefer_latest_frame,
             "smooth_alpha": runtime_settings.smooth_alpha,
             "reid_ttl_ms": runtime_settings.reid_ttl_ms,
@@ -418,6 +420,18 @@ def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
             "MVP_BYTETRACK_TRACK_ACTIVATION_THRESHOLD",
             0.25,
         ),
+        bytetrack_kalman_position_weight=_resolve_float(
+            args.bytetrack_kalman_position_weight,
+            profiled.get("bytetrack_kalman_position_weight"),
+            "MVP_BYTETRACK_KALMAN_POSITION_WEIGHT",
+            0.06,
+        ),
+        bytetrack_kalman_velocity_weight=_resolve_float(
+            args.bytetrack_kalman_velocity_weight,
+            profiled.get("bytetrack_kalman_velocity_weight"),
+            "MVP_BYTETRACK_KALMAN_VELOCITY_WEIGHT",
+            0.01125,
+        ),
         decode_backend=decode_backend,
         decode_buffer_size=args.decode_buffer_size,
         decode_drop_policy=args.decode_drop_policy,
@@ -440,7 +454,7 @@ def _default_video_source() -> str:
     if env_source:
         return env_source
 
-    preferred = Path(__file__).resolve().parents[1] / "data" / "HBTFZwMdcCw.mp4"
+    preferred = Path(__file__).resolve().parents[1] / "data" / "football.mp4"
     if preferred.exists() and preferred.is_file():
         return str(preferred)
     return "0"
@@ -451,9 +465,9 @@ def parse_args() -> argparse.Namespace:
         default=_default_video_source(),
         help="RTSP/HLS URL, video file path, or camera index (default: local test clip if present, else 0)",
     )
-    parser.add_argument("--fps", type=int, default=15, help="Processing FPS")
+    parser.add_argument("--fps", type=int, default=int(os.getenv("MVP_FPS", "30")), help="Processing FPS")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=int(os.getenv("MVP_PORT", "8765")))
 
     parser.add_argument(
         "--profile",
@@ -471,6 +485,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-imgsz", type=int, default=None)
     parser.add_argument("--track-buffer", type=int, default=int(os.getenv("MVP_TRACK_BUFFER", "30")))
     parser.add_argument("--bytetrack-track-activation-threshold", type=float, default=None)
+    parser.add_argument(
+        "--bytetrack-kalman-position-weight",
+        type=float,
+        default=None,
+        help="ByteTrack Kalman position process noise weight",
+    )
+    parser.add_argument(
+        "--bytetrack-kalman-velocity-weight",
+        type=float,
+        default=None,
+        help="ByteTrack Kalman velocity process noise weight",
+    )
     parser.add_argument(
         "--decode-backend",
         choices=["opencv", "pyav"],

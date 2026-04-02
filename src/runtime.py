@@ -9,7 +9,12 @@ from .detector import DetectorProtocol, YoloDetector
 from .postprocess import PostprocessConfig, TrackPostProcessor
 from .projector import LinearProjector, ProjectorProtocol
 from .recorder import JsonlRecorder
-from .tracker import ByteTrackAdapter, TrackerProtocol
+from .tracker import (
+    DEFAULT_BYTETRACK_KALMAN_POSITION_WEIGHT,
+    DEFAULT_BYTETRACK_KALMAN_VELOCITY_WEIGHT,
+    ByteTrackAdapter,
+    TrackerProtocol,
+)
 from .video_reader import DecodeConfig
 
 logger = logging.getLogger(__name__)
@@ -19,7 +24,7 @@ logger = logging.getLogger(__name__)
 class RuntimeSettings:
     performance_profile: str = "auto"
     effective_profile: str = "cpu"
-    target_fps: int = 15
+    target_fps: int = 30
     yolo_model: str = "yolov8n.pt"
     yolo_device: str = "cpu"
     yolo_half: bool = False
@@ -27,6 +32,8 @@ class RuntimeSettings:
     yolo_imgsz: int = 1280
     track_buffer: int = 30
     bytetrack_track_activation_threshold: float = 0.25
+    bytetrack_kalman_position_weight: float = DEFAULT_BYTETRACK_KALMAN_POSITION_WEIGHT
+    bytetrack_kalman_velocity_weight: float = DEFAULT_BYTETRACK_KALMAN_VELOCITY_WEIGHT
     decode_backend: str = "opencv"
     decode_buffer_size: int = 8
     decode_drop_policy: str = "drop_oldest"
@@ -72,6 +79,16 @@ def normalize_runtime_settings(settings: RuntimeSettings) -> RuntimeSettings:
         0.05,
         0.95,
     )
+    settings.bytetrack_kalman_position_weight = _clamp_float(
+        settings.bytetrack_kalman_position_weight,
+        1e-4,
+        1.0,
+    )
+    settings.bytetrack_kalman_velocity_weight = _clamp_float(
+        settings.bytetrack_kalman_velocity_weight,
+        1e-4,
+        1.0,
+    )
     settings.decode_backend = str(settings.decode_backend).strip().lower()
     if settings.decode_backend not in {"opencv", "pyav"}:
         settings.decode_backend = "opencv"
@@ -116,6 +133,8 @@ def profile_defaults(profile: str) -> dict[str, Any]:
     common: dict[str, Any] = {
         "yolo_conf": 0.20,
         "bytetrack_track_activation_threshold": 0.20,
+        "bytetrack_kalman_position_weight": DEFAULT_BYTETRACK_KALMAN_POSITION_WEIGHT,
+        "bytetrack_kalman_velocity_weight": DEFAULT_BYTETRACK_KALMAN_VELOCITY_WEIGHT,
         "prefer_latest_frame": True,
     }
 
@@ -167,12 +186,16 @@ def build_tracker(settings: RuntimeSettings) -> TrackerProtocol:
         track_buffer=settings.track_buffer,
         track_activation_threshold=settings.bytetrack_track_activation_threshold,
         frame_rate=settings.target_fps,
+        kalman_position_weight=settings.bytetrack_kalman_position_weight,
+        kalman_velocity_weight=settings.bytetrack_kalman_velocity_weight,
     )
     logger.info(
-        "Tracker backend: bytetrack (buffer=%s, activation=%s, fps=%s)",
+        "Tracker backend: bytetrack (buffer=%s, activation=%s, fps=%s, kalman_pos=%s, kalman_vel=%s)",
         settings.track_buffer,
         settings.bytetrack_track_activation_threshold,
         settings.target_fps,
+        settings.bytetrack_kalman_position_weight,
+        settings.bytetrack_kalman_velocity_weight,
     )
     return tracker
 

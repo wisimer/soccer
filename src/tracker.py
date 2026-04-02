@@ -6,6 +6,11 @@ import numpy as np
 
 from .models import Detection, TrackState
 
+BYTETRACK_BASE_KALMAN_POSITION_WEIGHT = 1.0 / 20.0
+BYTETRACK_BASE_KALMAN_VELOCITY_WEIGHT = 1.0 / 160.0
+DEFAULT_BYTETRACK_KALMAN_POSITION_WEIGHT = BYTETRACK_BASE_KALMAN_POSITION_WEIGHT * 1.2
+DEFAULT_BYTETRACK_KALMAN_VELOCITY_WEIGHT = BYTETRACK_BASE_KALMAN_VELOCITY_WEIGHT * 1.8
+
 
 class TrackerProtocol(Protocol):
     name: str
@@ -24,6 +29,8 @@ class ByteTrackAdapter:
         track_activation_threshold: float = 0.25,
         minimum_matching_threshold: float = 0.8,
         frame_rate: int = 30,
+        kalman_position_weight: float = DEFAULT_BYTETRACK_KALMAN_POSITION_WEIGHT,
+        kalman_velocity_weight: float = DEFAULT_BYTETRACK_KALMAN_VELOCITY_WEIGHT,
     ) -> None:
         try:
             import supervision as sv
@@ -39,9 +46,19 @@ class ByteTrackAdapter:
             minimum_matching_threshold=minimum_matching_threshold,
             frame_rate=frame_rate,
         )
+        self._kalman_position_weight = max(1e-4, float(kalman_position_weight))
+        self._kalman_velocity_weight = max(1e-4, float(kalman_velocity_weight))
+        self._apply_kalman_tuning(self._tracker.kalman_filter)
+        self._apply_kalman_tuning(self._tracker.shared_kalman)
         self._state_by_id: dict[int, TrackState] = {}
         self._max_missed_frames = max(8, track_buffer // 2)
         self._visible_missed_frames = min(self._max_missed_frames, max(3, frame_rate // 5))
+
+    def _apply_kalman_tuning(self, kalman_filter: object) -> None:
+        if hasattr(kalman_filter, "_std_weight_position"):
+            setattr(kalman_filter, "_std_weight_position", self._kalman_position_weight)
+        if hasattr(kalman_filter, "_std_weight_velocity"):
+            setattr(kalman_filter, "_std_weight_velocity", self._kalman_velocity_weight)
 
     def update(self, detections: list[Detection], ts_ms: int) -> list[TrackState]:
         if detections:
