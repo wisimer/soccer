@@ -1,0 +1,7 @@
+gmc:
+  enabled: true
+  method: sparseOptFlow
+  downscale: 2.0
+  min_points: 12
+  motion_deadband_px: 1.0
+  max_translation_px: 80.0

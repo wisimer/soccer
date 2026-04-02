@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
+import yaml
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -164,6 +165,12 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
             "bytetrack_track_activation_threshold": runtime_settings.bytetrack_track_activation_threshold,
             "bytetrack_kalman_position_weight": runtime_settings.bytetrack_kalman_position_weight,
             "bytetrack_kalman_velocity_weight": runtime_settings.bytetrack_kalman_velocity_weight,
+            "gmc_enabled": runtime_settings.gmc_enabled,
+            "gmc_method": runtime_settings.gmc_method,
+            "gmc_downscale": runtime_settings.gmc_downscale,
+            "gmc_min_points": runtime_settings.gmc_min_points,
+            "gmc_motion_deadband_px": runtime_settings.gmc_motion_deadband_px,
+            "gmc_max_translation_px": runtime_settings.gmc_max_translation_px,
             "prefer_latest_frame": runtime_settings.prefer_latest_frame,
             "smooth_alpha": runtime_settings.smooth_alpha,
             "reid_ttl_ms": runtime_settings.reid_ttl_ms,
@@ -385,10 +392,22 @@ def _resolve_str(
     return hard_default
 
 
+def _load_runtime_yaml() -> dict[str, Any]:
+    config_path = Path(os.getenv("MVP_CONFIG_PATH", Path(__file__).resolve().parents[1] / "config" / "runtime.yaml"))
+    if not config_path.exists() or not config_path.is_file():
+        return {}
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
 def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
     requested_profile = str(args.profile or os.getenv("MVP_PROFILE", "auto")).lower()
     effective_profile = resolve_effective_profile(requested_profile)
     profiled = profile_defaults(effective_profile)
+    yaml_config = _load_runtime_yaml()
+    gmc_config = yaml_config.get("gmc") if isinstance(yaml_config.get("gmc"), dict) else {}
 
     yolo_device = _resolve_str(args.yolo_device, profiled.get("yolo_device"), "MVP_YOLO_DEVICE", "cpu")
     yolo_half = _resolve_bool(args.yolo_half, profiled.get("yolo_half"), "MVP_YOLO_HALF", False)
@@ -431,6 +450,42 @@ def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
             profiled.get("bytetrack_kalman_velocity_weight"),
             "MVP_BYTETRACK_KALMAN_VELOCITY_WEIGHT",
             0.01125,
+        ),
+        gmc_enabled=_resolve_bool(
+            args.gmc_enabled,
+            gmc_config.get("enabled"),
+            "MVP_GMC_ENABLED",
+            True,
+        ),
+        gmc_method=_resolve_str(
+            args.gmc_method,
+            gmc_config.get("method"),
+            "MVP_GMC_METHOD",
+            "sparseOptFlow",
+        ),
+        gmc_downscale=_resolve_float(
+            args.gmc_downscale,
+            gmc_config.get("downscale"),
+            "MVP_GMC_DOWNSCALE",
+            2.0,
+        ),
+        gmc_min_points=_resolve_int(
+            args.gmc_min_points,
+            gmc_config.get("min_points"),
+            "MVP_GMC_MIN_POINTS",
+            12,
+        ),
+        gmc_motion_deadband_px=_resolve_float(
+            args.gmc_motion_deadband_px,
+            gmc_config.get("motion_deadband_px"),
+            "MVP_GMC_MOTION_DEADBAND_PX",
+            1.0,
+        ),
+        gmc_max_translation_px=_resolve_float(
+            args.gmc_max_translation_px,
+            gmc_config.get("max_translation_px"),
+            "MVP_GMC_MAX_TRANSLATION_PX",
+            80.0,
         ),
         decode_backend=decode_backend,
         decode_buffer_size=args.decode_buffer_size,
@@ -496,6 +551,32 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="ByteTrack Kalman velocity process noise weight",
+    )
+    parser.add_argument(
+        "--gmc-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable camera motion compensation before ByteTrack association",
+    )
+    parser.add_argument(
+        "--gmc-method",
+        choices=["off", "sparseOptFlow"],
+        default=None,
+        help="Camera motion compensation method",
+    )
+    parser.add_argument("--gmc-downscale", type=float, default=None, help="Downscale factor for GMC feature tracking")
+    parser.add_argument("--gmc-min-points", type=int, default=None, help="Minimum tracked feature points for GMC")
+    parser.add_argument(
+        "--gmc-motion-deadband-px",
+        type=float,
+        default=None,
+        help="Ignore GMC translation smaller than this pixel magnitude",
+    )
+    parser.add_argument(
+        "--gmc-max-translation-px",
+        type=float,
+        default=None,
+        help="Clamp per-frame GMC translation to this magnitude",
     )
     parser.add_argument(
         "--decode-backend",

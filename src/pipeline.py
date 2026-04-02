@@ -205,7 +205,7 @@ class StreamProcessor:
                 t0 = time.perf_counter()
                 detections = await asyncio.to_thread(self.detector.detect, frame)
                 t1 = time.perf_counter()
-                raw_tracks = await asyncio.to_thread(self.tracker.update, detections, process_ts_ms)
+                raw_tracks = await asyncio.to_thread(self.tracker.update, detections, process_ts_ms, frame)
                 t2 = time.perf_counter()
                 tracks = await asyncio.to_thread(self.postprocessor.update, raw_tracks, process_ts_ms)
                 t3 = time.perf_counter()

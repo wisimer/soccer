@@ -13,6 +13,7 @@ from .tracker import (
     DEFAULT_BYTETRACK_KALMAN_POSITION_WEIGHT,
     DEFAULT_BYTETRACK_KALMAN_VELOCITY_WEIGHT,
     ByteTrackAdapter,
+    GlobalMotionConfig,
     TrackerProtocol,
 )
 from .video_reader import DecodeConfig
@@ -34,6 +35,12 @@ class RuntimeSettings:
     bytetrack_track_activation_threshold: float = 0.25
     bytetrack_kalman_position_weight: float = DEFAULT_BYTETRACK_KALMAN_POSITION_WEIGHT
     bytetrack_kalman_velocity_weight: float = DEFAULT_BYTETRACK_KALMAN_VELOCITY_WEIGHT
+    gmc_enabled: bool = True
+    gmc_method: str = "sparseOptFlow"
+    gmc_downscale: float = 2.0
+    gmc_min_points: int = 12
+    gmc_motion_deadband_px: float = 1.0
+    gmc_max_translation_px: float = 80.0
     decode_backend: str = "opencv"
     decode_buffer_size: int = 8
     decode_drop_policy: str = "drop_oldest"
@@ -89,6 +96,13 @@ def normalize_runtime_settings(settings: RuntimeSettings) -> RuntimeSettings:
         1e-4,
         1.0,
     )
+    settings.gmc_method = str(settings.gmc_method).strip() or "off"
+    if settings.gmc_method.lower() != "sparseoptflow":
+        settings.gmc_method = "off"
+    settings.gmc_downscale = _clamp_float(settings.gmc_downscale, 1.0, 8.0)
+    settings.gmc_min_points = max(4, int(settings.gmc_min_points))
+    settings.gmc_motion_deadband_px = _clamp_float(settings.gmc_motion_deadband_px, 0.0, 10.0)
+    settings.gmc_max_translation_px = _clamp_float(settings.gmc_max_translation_px, 4.0, 400.0)
     settings.decode_backend = str(settings.decode_backend).strip().lower()
     if settings.decode_backend not in {"opencv", "pyav"}:
         settings.decode_backend = "opencv"
@@ -135,6 +149,12 @@ def profile_defaults(profile: str) -> dict[str, Any]:
         "bytetrack_track_activation_threshold": 0.20,
         "bytetrack_kalman_position_weight": DEFAULT_BYTETRACK_KALMAN_POSITION_WEIGHT,
         "bytetrack_kalman_velocity_weight": DEFAULT_BYTETRACK_KALMAN_VELOCITY_WEIGHT,
+        "gmc_enabled": True,
+        "gmc_method": "sparseOptFlow",
+        "gmc_downscale": 2.0,
+        "gmc_min_points": 12,
+        "gmc_motion_deadband_px": 1.0,
+        "gmc_max_translation_px": 80.0,
         "prefer_latest_frame": True,
     }
 
@@ -188,14 +208,25 @@ def build_tracker(settings: RuntimeSettings) -> TrackerProtocol:
         frame_rate=settings.target_fps,
         kalman_position_weight=settings.bytetrack_kalman_position_weight,
         kalman_velocity_weight=settings.bytetrack_kalman_velocity_weight,
+        gmc_config=GlobalMotionConfig(
+            enabled=settings.gmc_enabled,
+            method=settings.gmc_method,
+            downscale=settings.gmc_downscale,
+            min_points=settings.gmc_min_points,
+            motion_deadband_px=settings.gmc_motion_deadband_px,
+            max_translation_px=settings.gmc_max_translation_px,
+        ),
     )
     logger.info(
-        "Tracker backend: bytetrack (buffer=%s, activation=%s, fps=%s, kalman_pos=%s, kalman_vel=%s)",
+        "Tracker backend: bytetrack (buffer=%s, activation=%s, fps=%s, kalman_pos=%s, kalman_vel=%s, gmc_enabled=%s, gmc_method=%s, gmc_downscale=%s)",
         settings.track_buffer,
         settings.bytetrack_track_activation_threshold,
         settings.target_fps,
         settings.bytetrack_kalman_position_weight,
         settings.bytetrack_kalman_velocity_weight,
+        settings.gmc_enabled,
+        settings.gmc_method,
+        settings.gmc_downscale,
     )
     return tracker
 
