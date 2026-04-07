@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .detector import DetectorProtocol, TeamClassifierConfig, YoloDetector
+from .detector import BallDetectionConfig, DetectorProtocol, HybridDetector, TeamClassifierConfig, YoloDetector
 from .postprocess import PostprocessConfig, TrackPostProcessor
 from .projector import LinearProjector, ProjectorProtocol
 from .recorder import JsonlRecorder
@@ -34,6 +34,17 @@ class RuntimeSettings:
     yolo_conf: float = 0.25
     yolo_imgsz: int = 1280
     yolo_batch_size: int = 1
+    ball_yolo_model: str | None = None
+    ball_yolo_device: str = "cpu"
+    ball_yolo_half: bool = False
+    ball_yolo_conf: float = 0.12
+    ball_yolo_imgsz: int = 1536
+    ball_yolo_batch_size: int = 1
+    ball_yolo_backend: str = "auto"
+    ball_min_area: float = 6.0
+    ball_max_area: float = 3000.0
+    ball_max_aspect_ratio: float = 2.5
+    ball_max_detections: int = 1
     track_buffer: int = 30
     bytetrack_track_activation_threshold: float = 0.25
     bytetrack_kalman_position_weight: float = DEFAULT_BYTETRACK_KALMAN_POSITION_WEIGHT
@@ -92,6 +103,23 @@ def resolve_preferred_yolo_model(explicit: str | None = None) -> str:
     return "yolov8n.pt"
 
 
+def resolve_preferred_ball_yolo_model(explicit: str | None = None) -> str | None:
+    if explicit is not None:
+        stripped = str(explicit).strip()
+        if stripped:
+            return stripped
+
+    base_dir = Path(__file__).resolve().parents[1]
+    candidates = (
+        base_dir / "models" / "yolov5m-football-best.pt",
+        base_dir / "models" / "football-ball-yolov5m.pt",
+    )
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def _clamp_float(value: float, minimum: float, maximum: float) -> float:
     """Clamp a float into the requested range."""
 
@@ -116,6 +144,23 @@ def normalize_runtime_settings(settings: RuntimeSettings) -> RuntimeSettings:
     settings.yolo_imgsz = max(320, int(settings.yolo_imgsz))
     settings.yolo_imgsz = max(32, (settings.yolo_imgsz // 32) * 32)
     settings.yolo_batch_size = max(1, int(settings.yolo_batch_size))
+    settings.ball_yolo_model = resolve_preferred_ball_yolo_model(settings.ball_yolo_model)
+    settings.ball_yolo_conf = _clamp_float(settings.ball_yolo_conf, 0.01, 0.95)
+    settings.ball_yolo_imgsz = max(320, int(settings.ball_yolo_imgsz))
+    settings.ball_yolo_imgsz = max(32, (settings.ball_yolo_imgsz // 32) * 32)
+    settings.ball_yolo_batch_size = max(1, int(settings.ball_yolo_batch_size))
+    settings.ball_yolo_backend = str(settings.ball_yolo_backend).strip().lower() or "auto"
+    if settings.ball_yolo_backend not in {"auto", "ultralytics", "yolov5"}:
+        settings.ball_yolo_backend = "auto"
+    if settings.ball_yolo_backend == "auto":
+        if "yolov5" in str(settings.ball_yolo_model).strip().lower():
+            settings.ball_yolo_backend = "yolov5"
+        else:
+            settings.ball_yolo_backend = "ultralytics"
+    settings.ball_min_area = max(1.0, float(settings.ball_min_area))
+    settings.ball_max_area = max(settings.ball_min_area, float(settings.ball_max_area))
+    settings.ball_max_aspect_ratio = _clamp_float(settings.ball_max_aspect_ratio, 1.0, 10.0)
+    settings.ball_max_detections = max(1, int(settings.ball_max_detections))
     settings.track_buffer = max(8, int(settings.track_buffer))
     settings.bytetrack_track_activation_threshold = _clamp_float(
         settings.bytetrack_track_activation_threshold,
@@ -167,8 +212,19 @@ def normalize_runtime_settings(settings: RuntimeSettings) -> RuntimeSettings:
     settings.reid_ttl_ms = max(200, int(settings.reid_ttl_ms))
     settings.reid_distance_px = max(1.0, float(settings.reid_distance_px))
     settings.reid_max_inactive_tracks = max(16, int(settings.reid_max_inactive_tracks))
+    yolo_backend_hint = str(settings.yolo_model).strip().lower()
+    ball_yolo_backend_hint = str(settings.ball_yolo_backend).strip().lower()
+    ball_model_hint = str(settings.ball_yolo_model).strip().lower()
+    if settings.yolo_half and "yolov5" in yolo_backend_hint:
+        settings.yolo_half = False
+    if settings.ball_yolo_half and (
+        ball_yolo_backend_hint == "yolov5" or "yolov5" in ball_model_hint
+    ):
+        settings.ball_yolo_half = False
     if settings.yolo_half and not str(settings.yolo_device).lower().startswith("cuda"):
         settings.yolo_half = False
+    if settings.ball_yolo_half and not str(settings.ball_yolo_device).lower().startswith("cuda"):
+        settings.ball_yolo_half = False
     return settings
 
 
@@ -201,6 +257,7 @@ def profile_defaults(profile: str) -> dict[str, Any]:
     normalized = (profile or "cpu").strip().lower()
     common: dict[str, Any] = {
         "yolo_conf": 0.20,
+        "ball_yolo_conf": 0.12,
         "bytetrack_track_activation_threshold": 0.20,
         "bytetrack_kalman_position_weight": DEFAULT_BYTETRACK_KALMAN_POSITION_WEIGHT,
         "bytetrack_kalman_velocity_weight": DEFAULT_BYTETRACK_KALMAN_VELOCITY_WEIGHT,
@@ -212,6 +269,7 @@ def profile_defaults(profile: str) -> dict[str, Any]:
         "gmc_max_translation_px": 80.0,
         "prefer_latest_frame": True,
         "yolo_batch_size": 1,
+        "ball_yolo_batch_size": 1,
         "reid_enabled": True,
         "reid_max_inactive_tracks": 256,
     }
@@ -223,6 +281,9 @@ def profile_defaults(profile: str) -> dict[str, Any]:
                 "yolo_half": True,
                 "yolo_imgsz": 768,
                 "yolo_batch_size": 2,
+                "ball_yolo_device": "cuda:0",
+                "ball_yolo_half": True,
+                "ball_yolo_imgsz": 1536,
                 "decode_backend": "pyav",
                 "decode_opencv_buffer_size": 1,
             }
@@ -233,6 +294,9 @@ def profile_defaults(profile: str) -> dict[str, Any]:
                 "yolo_device": "cpu",
                 "yolo_half": False,
                 "yolo_imgsz": 640,
+                "ball_yolo_device": "cpu",
+                "ball_yolo_half": False,
+                "ball_yolo_imgsz": 1280,
                 "decode_backend": "opencv",
                 "decode_opencv_buffer_size": 2,
             }
@@ -244,29 +308,58 @@ def profile_defaults(profile: str) -> dict[str, Any]:
 def build_detector(settings: RuntimeSettings) -> DetectorProtocol:
     """Build the detector with merged runtime settings."""
 
-    detector = YoloDetector(
+    team_config = TeamClassifierConfig(
+        mode=settings.team_classification_mode,
+        team_a_primary_color=settings.team_a_primary_color,
+        team_b_primary_color=settings.team_b_primary_color,
+        saturation_threshold=settings.team_color_saturation_threshold,
+        min_color_ratio=settings.team_color_min_ratio,
+    )
+    player_detector = YoloDetector(
         model_path=settings.yolo_model,
         device=settings.yolo_device,
         confidence_threshold=settings.yolo_conf,
         image_size=settings.yolo_imgsz,
         use_half=settings.yolo_half,
         batch_size=settings.yolo_batch_size,
-        team_config=TeamClassifierConfig(
-            mode=settings.team_classification_mode,
-            team_a_primary_color=settings.team_a_primary_color,
-            team_b_primary_color=settings.team_b_primary_color,
-            saturation_threshold=settings.team_color_saturation_threshold,
-            min_color_ratio=settings.team_color_min_ratio,
-        ),
+        team_config=team_config,
+        allowed_kinds=("player",) if settings.ball_yolo_model else None,
     )
+    detector: DetectorProtocol = player_detector
+    if settings.ball_yolo_model:
+        ball_detector = YoloDetector(
+            model_path=settings.ball_yolo_model,
+            device=settings.ball_yolo_device,
+            confidence_threshold=settings.ball_yolo_conf,
+            image_size=settings.ball_yolo_imgsz,
+            use_half=settings.ball_yolo_half,
+            batch_size=settings.ball_yolo_batch_size,
+            team_config=team_config,
+            backend=settings.ball_yolo_backend,
+            allowed_kinds=("ball",),
+            ball_config=BallDetectionConfig(
+                min_area=settings.ball_min_area,
+                max_area=settings.ball_max_area,
+                max_aspect_ratio=settings.ball_max_aspect_ratio,
+                max_detections=settings.ball_max_detections,
+            ),
+        )
+        detector = HybridDetector(player_detector=player_detector, ball_detector=ball_detector)
     logger.info(
-        "Detector backend: yolo (%s, device=%s, half=%s, conf=%s, imgsz=%s, batch=%s, team_mode=%s, profile=%s/%s)",
+        "Detector backend: %s (player_model=%s, player_device=%s, player_half=%s, player_conf=%s, player_imgsz=%s, player_batch=%s, ball_model=%s, ball_device=%s, ball_half=%s, ball_conf=%s, ball_imgsz=%s, ball_batch=%s, team_mode=%s, profile=%s/%s)",
+        getattr(detector, "name", detector.__class__.__name__),
         settings.yolo_model,
         settings.yolo_device,
         settings.yolo_half,
         settings.yolo_conf,
         settings.yolo_imgsz,
         settings.yolo_batch_size,
+        settings.ball_yolo_model,
+        settings.ball_yolo_device,
+        settings.ball_yolo_half,
+        settings.ball_yolo_conf,
+        settings.ball_yolo_imgsz,
+        settings.ball_yolo_batch_size,
         settings.team_classification_mode,
         settings.performance_profile,
         settings.effective_profile,

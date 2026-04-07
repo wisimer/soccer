@@ -17,6 +17,17 @@ detection:
   yolo_conf: 0.2
   yolo_imgsz: 1280
   yolo_batch_size: 1
+  ball_yolo_model:
+  ball_yolo_device:
+  ball_yolo_half:
+  ball_yolo_conf: 0.12
+  ball_yolo_imgsz: 1536
+  ball_yolo_batch_size: 1
+  ball_yolo_backend: yolov5
+  ball_min_area: 6.0
+  ball_max_area: 3000.0
+  ball_max_aspect_ratio: 2.5
+  ball_max_detections: 1
 
 # Tracking and camera motion compensation.
 tracker:

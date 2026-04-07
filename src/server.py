@@ -138,6 +138,17 @@ def _runtime_snapshot(
         "yolo_conf": runtime_settings.yolo_conf,
         "yolo_imgsz": runtime_settings.yolo_imgsz,
         "yolo_batch_size": runtime_settings.yolo_batch_size,
+        "ball_yolo_model": runtime_settings.ball_yolo_model,
+        "ball_yolo_device": runtime_settings.ball_yolo_device,
+        "ball_yolo_half": runtime_settings.ball_yolo_half,
+        "ball_yolo_conf": runtime_settings.ball_yolo_conf,
+        "ball_yolo_imgsz": runtime_settings.ball_yolo_imgsz,
+        "ball_yolo_batch_size": runtime_settings.ball_yolo_batch_size,
+        "ball_yolo_backend": runtime_settings.ball_yolo_backend,
+        "ball_min_area": runtime_settings.ball_min_area,
+        "ball_max_area": runtime_settings.ball_max_area,
+        "ball_max_aspect_ratio": runtime_settings.ball_max_aspect_ratio,
+        "ball_max_detections": runtime_settings.ball_max_detections,
         "track_buffer": runtime_settings.track_buffer,
         "decode_backend": runtime_settings.decode_backend,
         "decode_buffer_size": runtime_settings.decode_buffer_size,
@@ -534,6 +545,83 @@ def build_runtime_settings(args: argparse.Namespace) -> RuntimeSettings:
             "MVP_YOLO_BATCH_SIZE",
             1,
         ),
+        ball_yolo_model=_resolve_str(
+            arg("ball_yolo_model"),
+            detection_config.get("ball_yolo_model"),
+            None,
+            "MVP_BALL_YOLO_MODEL",
+            "",
+        ),
+        ball_yolo_device=_resolve_str(
+            arg("ball_yolo_device"),
+            detection_config.get("ball_yolo_device"),
+            profiled.get("ball_yolo_device"),
+            "MVP_BALL_YOLO_DEVICE",
+            yolo_device,
+        ),
+        ball_yolo_half=_resolve_bool(
+            arg("ball_yolo_half"),
+            detection_config.get("ball_yolo_half"),
+            profiled.get("ball_yolo_half"),
+            "MVP_BALL_YOLO_HALF",
+            yolo_half,
+        ),
+        ball_yolo_conf=_resolve_float(
+            arg("ball_yolo_conf"),
+            detection_config.get("ball_yolo_conf"),
+            profiled.get("ball_yolo_conf"),
+            "MVP_BALL_YOLO_CONF",
+            0.12,
+        ),
+        ball_yolo_imgsz=_resolve_int(
+            arg("ball_yolo_imgsz"),
+            detection_config.get("ball_yolo_imgsz"),
+            profiled.get("ball_yolo_imgsz"),
+            "MVP_BALL_YOLO_IMGSZ",
+            1536,
+        ),
+        ball_yolo_batch_size=_resolve_int(
+            arg("ball_yolo_batch_size"),
+            detection_config.get("ball_yolo_batch_size"),
+            profiled.get("ball_yolo_batch_size"),
+            "MVP_BALL_YOLO_BATCH_SIZE",
+            1,
+        ),
+        ball_yolo_backend=_resolve_str(
+            arg("ball_yolo_backend"),
+            detection_config.get("ball_yolo_backend"),
+            None,
+            "MVP_BALL_YOLO_BACKEND",
+            "auto",
+        ),
+        ball_min_area=_resolve_float(
+            arg("ball_min_area"),
+            detection_config.get("ball_min_area"),
+            None,
+            "MVP_BALL_MIN_AREA",
+            6.0,
+        ),
+        ball_max_area=_resolve_float(
+            arg("ball_max_area"),
+            detection_config.get("ball_max_area"),
+            None,
+            "MVP_BALL_MAX_AREA",
+            3000.0,
+        ),
+        ball_max_aspect_ratio=_resolve_float(
+            arg("ball_max_aspect_ratio"),
+            detection_config.get("ball_max_aspect_ratio"),
+            None,
+            "MVP_BALL_MAX_ASPECT_RATIO",
+            2.5,
+        ),
+        ball_max_detections=_resolve_int(
+            arg("ball_max_detections"),
+            detection_config.get("ball_max_detections"),
+            None,
+            "MVP_BALL_MAX_DETECTIONS",
+            1,
+        ),
         track_buffer=_resolve_int(arg("track_buffer"), tracker_config.get("track_buffer"), None, "MVP_TRACK_BUFFER", 30),
         bytetrack_track_activation_threshold=_resolve_float(
             arg("bytetrack_track_activation_threshold"),
@@ -785,6 +873,17 @@ def _add_detection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--yolo-conf", type=float, default=None)
     parser.add_argument("--yolo-imgsz", type=int, default=None)
     parser.add_argument("--yolo-batch-size", type=int, default=None)
+    parser.add_argument("--ball-yolo-model", default=None)
+    parser.add_argument("--ball-yolo-device", default=None)
+    parser.add_argument("--ball-yolo-half", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--ball-yolo-conf", type=float, default=None)
+    parser.add_argument("--ball-yolo-imgsz", type=int, default=None)
+    parser.add_argument("--ball-yolo-batch-size", type=int, default=None)
+    parser.add_argument("--ball-yolo-backend", choices=["auto", "ultralytics", "yolov5"], default=None)
+    parser.add_argument("--ball-min-area", type=float, default=None)
+    parser.add_argument("--ball-max-area", type=float, default=None)
+    parser.add_argument("--ball-max-aspect-ratio", type=float, default=None)
+    parser.add_argument("--ball-max-detections", type=int, default=None)
 
 
 def _add_tracker_args(parser: argparse.ArgumentParser) -> None:
