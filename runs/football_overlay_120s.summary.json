@@ -1,0 +1,13 @@
+{
+  "source": "/home/chenyu/workplace/soccer/data/football.mp4",
+  "output": "/home/chenyu/workplace/soccer/runs/football_overlay_120s.avi",
+  "profile": "cpu",
+  "frames": 3000,
+  "input_fps": 25.0,
+  "clip_duration_s": 120.0,
+  "wall_time_s": 1771.23,
+  "offline_render_fps": 1.694,
+  "detect_ms_avg": 565.387,
+  "track_ms_avg": 11.266,
+  "post_ms_avg": 0.23
+}

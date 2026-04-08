@@ -1,0 +1,18 @@
+{
+  "source": "/home/chenyu/workplace/soccer/data/football.mp4",
+  "output": "/home/chenyu/workplace/soccer/runs/football_overlay_full_gpu.avi",
+  "summary": "/home/chenyu/workplace/soccer/runs/football_overlay_full_gpu.summary.json",
+  "effective_profile": "nvidia",
+  "yolo_device": "cuda:0",
+  "ball_yolo_device": "cuda:0",
+  "input_fps": 25.0,
+  "frames": 21931,
+  "video_duration_s": 877.24,
+  "wall_time_s": 1489.104,
+  "offline_render_fps": 14.728,
+  "detect_ms_avg": 41.442,
+  "track_ms_avg": 11.414,
+  "post_ms_avg": 0.217,
+  "detections_per_frame_avg": 15.148,
+  "tracks_per_frame_avg": 14.99
+}
