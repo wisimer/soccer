@@ -66,7 +66,7 @@ class StreamProcessor:
         self.source_arg = source
         self.target_fps = target_fps
         self.reconnect_sleep_s = reconnect_sleep_s
-        self.detector = detector or YoloDetector()
+        self.detector = detector or YoloDetector(allowed_kinds=("ball",))
         self.tracker = tracker or ByteTrackAdapter(frame_rate=target_fps)
         self.projector = projector or LinearProjector()
         self.reader = BufferedVideoReader(

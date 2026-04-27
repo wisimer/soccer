@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .detector import BallDetectionConfig, DetectorProtocol, HybridDetector, TeamClassifierConfig, YoloDetector
+from .detector import BallDetectionConfig, DetectorProtocol, TeamClassifierConfig, YoloDetector
 from .postprocess import PostprocessConfig, TrackPostProcessor
 from .projector import LinearProjector, ProjectorProtocol
 from .recorder import JsonlRecorder
@@ -315,19 +315,15 @@ def build_detector(settings: RuntimeSettings) -> DetectorProtocol:
         saturation_threshold=settings.team_color_saturation_threshold,
         min_color_ratio=settings.team_color_min_ratio,
     )
-    player_detector = YoloDetector(
-        model_path=settings.yolo_model,
-        device=settings.yolo_device,
-        confidence_threshold=settings.yolo_conf,
-        image_size=settings.yolo_imgsz,
-        use_half=settings.yolo_half,
-        batch_size=settings.yolo_batch_size,
-        team_config=team_config,
-        allowed_kinds=("player",) if settings.ball_yolo_model else None,
+    ball_config = BallDetectionConfig(
+        min_area=settings.ball_min_area,
+        max_area=settings.ball_max_area,
+        max_aspect_ratio=settings.ball_max_aspect_ratio,
+        max_detections=settings.ball_max_detections,
     )
-    detector: DetectorProtocol = player_detector
+
     if settings.ball_yolo_model:
-        ball_detector = YoloDetector(
+        detector = YoloDetector(
             model_path=settings.ball_yolo_model,
             device=settings.ball_yolo_device,
             confidence_threshold=settings.ball_yolo_conf,
@@ -337,17 +333,24 @@ def build_detector(settings: RuntimeSettings) -> DetectorProtocol:
             team_config=team_config,
             backend=settings.ball_yolo_backend,
             allowed_kinds=("ball",),
-            ball_config=BallDetectionConfig(
-                min_area=settings.ball_min_area,
-                max_area=settings.ball_max_area,
-                max_aspect_ratio=settings.ball_max_aspect_ratio,
-                max_detections=settings.ball_max_detections,
-            ),
+            ball_config=ball_config,
         )
-        detector = HybridDetector(player_detector=player_detector, ball_detector=ball_detector)
+    else:
+        detector = YoloDetector(
+            model_path=settings.yolo_model,
+            device=settings.yolo_device,
+            confidence_threshold=settings.yolo_conf,
+            image_size=settings.yolo_imgsz,
+            use_half=settings.yolo_half,
+            batch_size=settings.yolo_batch_size,
+            team_config=team_config,
+            allowed_kinds=("ball",),
+            ball_config=ball_config,
+        )
     logger.info(
-        "Detector backend: %s (player_model=%s, player_device=%s, player_half=%s, player_conf=%s, player_imgsz=%s, player_batch=%s, ball_model=%s, ball_device=%s, ball_half=%s, ball_conf=%s, ball_imgsz=%s, ball_batch=%s, team_mode=%s, profile=%s/%s)",
+        "Detector backend: %s (ball_only=%s, yolo_model=%s, yolo_device=%s, yolo_half=%s, yolo_conf=%s, yolo_imgsz=%s, yolo_batch=%s, ball_model=%s, ball_device=%s, ball_half=%s, ball_conf=%s, ball_imgsz=%s, ball_batch=%s, team_mode=%s, profile=%s/%s)",
         getattr(detector, "name", detector.__class__.__name__),
+        True,
         settings.yolo_model,
         settings.yolo_device,
         settings.yolo_half,
