@@ -208,17 +208,6 @@ h3 {
   background: #000;
 }
 
-.pitch-canvas {
-  position: absolute;
-  right: 10px;
-  top: 10px;
-  width: 220px;
-  height: auto;
-  border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  background: rgba(0, 0, 0, 0.35);
-}
-
 .timeline-wrap {
   margin-top: 10px;
 }
@@ -339,7 +328,7 @@ h3 {
 
 .export-row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: 10px;
   margin-bottom: 10px;
 }

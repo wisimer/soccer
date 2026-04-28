@@ -1749,10 +1749,6 @@ bootstrap();
   const exportStatusEl = document.getElementById("exportStatus");
   const downloadLinkEl = document.getElementById("downloadLink");
   const resolutionEl = document.getElementById("resolution");
-  const includePitchEl = document.getElementById("includePitch");
-  const togglePitchEl = document.getElementById("togglePitch");
-  const pitchCanvas = document.getElementById("pitchCanvas");
-  const pitchCtx = pitchCanvas ? pitchCanvas.getContext("2d") : null;
 
   function clamp(v, lo, hi) {
     return Math.max(lo, Math.min(hi, v));
@@ -1821,7 +1817,6 @@ bootstrap();
   let currentJob = null;
   let segments = [];
   let durationS = 0;
-  let ballTrack = [];
 
   let polling = null;
   let exportingPoll = null;
@@ -1845,7 +1840,6 @@ bootstrap();
     currentJobId = String(job.job_id || "");
     durationS = Number(job.duration_s) || durationS || 0;
     segments = normalizeSegments(job.segments);
-    ballTrack = Array.isArray(job.ball_track) ? job.ball_track : [];
     jobText.textContent = `job: ${currentJobId}`;
     downloadLinkEl.classList.add("hidden");
     downloadLinkEl.href = "#";
@@ -2244,7 +2238,6 @@ bootstrap();
         method: "POST",
         body: JSON.stringify({
           resolution: String(resolutionEl.value || "source"),
-          include_pitch: includePitchEl.value === "1",
         }),
       });
       if (exportingPoll) {
@@ -2274,94 +2267,6 @@ bootstrap();
       exportStatusEl.textContent = `导出失败：${e.message || e}`;
     }
   });
-
-  togglePitchEl.addEventListener("change", () => {
-    if (!pitchCanvas) {
-      return;
-    }
-    pitchCanvas.classList.toggle("hidden", !togglePitchEl.checked);
-  });
-
-  function pickBallAt(t) {
-    const arr = ballTrack;
-    if (!arr || arr.length === 0) {
-      return null;
-    }
-    let lo = 0;
-    let hi = arr.length - 1;
-    const target = Number(t) || 0;
-    while (lo < hi) {
-      const mid = Math.floor((lo + hi) / 2);
-      if (Number(arr[mid].t_s) < target) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    return arr[lo] || arr[arr.length - 1];
-  }
-
-  function pitchDraw(now) {
-    if (!pitchCtx || !pitchCanvas || !togglePitchEl.checked) {
-      requestAnimationFrame(pitchDraw);
-      return;
-    }
-    const w = pitchCanvas.width;
-    const h = pitchCanvas.height;
-    pitchCtx.clearRect(0, 0, w, h);
-    pitchCtx.fillStyle = "rgba(20, 90, 20, 0.9)";
-    pitchCtx.fillRect(0, 0, w, h);
-    pitchCtx.strokeStyle = "rgba(245,245,245,0.9)";
-    pitchCtx.lineWidth = 2;
-    pitchCtx.strokeRect(6, 6, w - 12, h - 12);
-    pitchCtx.lineWidth = 1;
-    pitchCtx.beginPath();
-    pitchCtx.moveTo(w / 2, 6);
-    pitchCtx.lineTo(w / 2, h - 6);
-    pitchCtx.stroke();
-    pitchCtx.beginPath();
-    pitchCtx.arc(w / 2, h / 2, Math.min(w, h) * 0.12, 0, Math.PI * 2);
-    pitchCtx.stroke();
-
-    const t = videoEl ? Number(videoEl.currentTime) || 0 : 0;
-    const ball = pickBallAt(t);
-    if (ball) {
-      const x = clamp((Number(ball.x_m) || 0) / 105, 0, 1);
-      const y = clamp((Number(ball.y_m) || 0) / 68, 0, 1);
-      const px = 6 + x * (w - 12);
-      const py = 6 + y * (h - 12);
-
-      pitchCtx.fillStyle = "rgba(0, 220, 255, 0.95)";
-      pitchCtx.beginPath();
-      pitchCtx.arc(px, py, Math.max(4, Math.min(w, h) * 0.03), 0, Math.PI * 2);
-      pitchCtx.fill();
-
-      const idx = Math.max(0, (ballTrack || []).findIndex((v) => v === ball));
-      if (idx > 0 && ballTrack[idx - 1]) {
-        const prev = ballTrack[idx - 1];
-        const dt = (Number(ball.t_s) || 0) - (Number(prev.t_s) || 0);
-        if (dt > 1e-3) {
-          const vx = ((Number(ball.x_m) || 0) - (Number(prev.x_m) || 0)) / dt;
-          const vy = ((Number(ball.y_m) || 0) - (Number(prev.y_m) || 0)) / dt;
-          const speed = Math.sqrt(vx * vx + vy * vy);
-          const scale = clamp(speed / 15, 0, 1) * (Math.min(w, h) * 0.22);
-          pitchCtx.strokeStyle = "rgba(255, 220, 0, 0.9)";
-          pitchCtx.lineWidth = 2;
-          pitchCtx.beginPath();
-          pitchCtx.moveTo(px, py);
-          pitchCtx.lineTo(px + vx * scale, py + vy * scale);
-          pitchCtx.stroke();
-          pitchCtx.fillStyle = "rgba(255,255,255,0.9)";
-          pitchCtx.font = "12px system-ui, sans-serif";
-          pitchCtx.fillText(`${speed.toFixed(1)} m/s`, 10, h - 10);
-        }
-      }
-    }
-
-    requestAnimationFrame(pitchDraw);
-  }
-
-  requestAnimationFrame(pitchDraw);
 
   function updatePlayhead() {
     if (!timelineEl) {

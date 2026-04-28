@@ -40,14 +40,9 @@
           <div class="preview-card">
             <div class="preview-toolbar">
               <button id="addSegmentBtn" class="btn">以当前时间新增片段</button>
-              <label class="switch">
-                <input id="togglePitch" type="checkbox" checked />
-                <span>显示虚拟球场</span>
-              </label>
             </div>
             <div class="preview-area">
               <video id="video" class="video" controls playsinline></video>
-              <canvas id="pitchCanvas" class="pitch-canvas" width="420" height="272"></canvas>
             </div>
 
             <div class="timeline-wrap">
@@ -68,13 +63,6 @@
                   <option value="source">源分辨率</option>
                   <option value="720p">720p</option>
                   <option value="1080p">1080p</option>
-                </select>
-              </label>
-              <label class="field">
-                <span>合成虚拟球场</span>
-                <select id="includePitch" class="select">
-                  <option value="0">不合成</option>
-                  <option value="1">合成</option>
                 </select>
               </label>
             </div>

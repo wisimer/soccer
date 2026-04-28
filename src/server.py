@@ -103,7 +103,6 @@ class ClipJobStatus(BaseModel):
     width: int | None = None
     height: int | None = None
     segments: list[ClipSegment] = Field(default_factory=list)
-    ball_track: list[dict[str, Any]] = Field(default_factory=list)
     export_url: str | None = None
     export_status: str | None = None
 
@@ -497,46 +496,149 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
 
             track = job["ball_track"]
             track.sort(key=lambda item: float(item.get("t_s", 0.0)))
-            speeds: list[tuple[float, float]] = []
+            samples: list[dict[str, float]] = []
             for i in range(1, len(track)):
-                t0 = float(track[i - 1]["t_s"])
-                t1 = float(track[i]["t_s"])
+                t0 = float(track[i - 1].get("t_s", 0.0))
+                t1 = float(track[i].get("t_s", 0.0))
                 dt = t1 - t0
                 if dt <= 1e-6:
                     continue
-                dx = float(track[i]["x_m"]) - float(track[i - 1]["x_m"])
-                dy = float(track[i]["y_m"]) - float(track[i - 1]["y_m"])
-                speed = math.sqrt(dx * dx + dy * dy) / dt
-                speeds.append((t1, speed))
+                x0 = float(track[i - 1].get("x_m", 0.0))
+                y0 = float(track[i - 1].get("y_m", 0.0))
+                x1 = float(track[i].get("x_m", 0.0))
+                y1 = float(track[i].get("y_m", 0.0))
+                vx = (x1 - x0) / dt
+                vy = (y1 - y0) / dt
+                speed = math.sqrt(vx * vx + vy * vy)
+                samples.append(
+                    {
+                        "t": t1,
+                        "x": x1,
+                        "y": y1,
+                        "vx": vx,
+                        "vy": vy,
+                        "speed": speed,
+                    }
+                )
 
-            peaks: list[tuple[float, float]] = []
-            for i in range(1, len(speeds) - 1):
-                t, s = speeds[i]
-                if s > speeds[i - 1][1] and s >= speeds[i + 1][1]:
-                    peaks.append((t, s))
-            peaks.sort(key=lambda item: item[1], reverse=True)
+            duration = float(duration_s or (samples[-1]["t"] if samples else 0.0) or 0.0)
+            pitch_len = 105.0
+            pitch_w = 68.0
+            box_depth = 16.5
+            box_width = 40.32
+            box_y0 = (pitch_w - box_width) * 0.5
+            box_y1 = box_y0 + box_width
 
-            duration = float(duration_s or (speeds[-1][0] if speeds else 0.0) or 0.0)
-            min_gap_s = 6.0
-            chosen: list[tuple[float, float]] = []
-            for t, s in peaks:
-                if s < 4.2:
+            def in_penalty_area(x: float, y: float) -> bool:
+                if y < box_y0 or y > box_y1:
+                    return False
+                return x <= box_depth or x >= (pitch_len - box_depth)
+
+            def near_goal(x: float) -> bool:
+                return x <= 25.0 or x >= 80.0
+
+            events: list[dict[str, Any]] = []
+            for item in samples:
+                t = float(item["t"])
+                x = float(item["x"])
+                y = float(item["y"])
+                vx = float(item["vx"])
+                speed = float(item["speed"])
+
+                if speed >= 12.0 and near_goal(x):
+                    toward_left_goal = x <= 35.0 and vx < 0
+                    toward_right_goal = x >= 70.0 and vx > 0
+                    if toward_left_goal or toward_right_goal:
+                        events.append({"t": t, "type": "shot", "score": speed})
+
+                if speed >= 7.0 and in_penalty_area(x, y):
+                    events.append({"t": t, "type": "penalty_speed", "score": speed})
+
+            last_angle: float | None = None
+            last_t: float | None = None
+            streak = 0
+            streak_start: float | None = None
+            cooldown_until = 0.0
+            for item in samples:
+                t = float(item["t"])
+                speed = float(item["speed"])
+                if t < cooldown_until:
                     continue
-                if all(abs(t - prev_t) >= min_gap_s for prev_t, _ in chosen):
-                    chosen.append((t, s))
-                if len(chosen) >= 8:
+                if speed < 4.0 or speed > 10.0:
+                    last_angle = None
+                    last_t = None
+                    streak = 0
+                    streak_start = None
+                    continue
+
+                angle = math.atan2(float(item["vy"]), float(item["vx"]))
+                if last_angle is not None and last_t is not None:
+                    dt = t - last_t
+                    raw = angle - last_angle
+                    delta = abs((raw + math.pi) % (2 * math.pi) - math.pi)
+                    if dt <= 1.8 and delta >= 0.9:
+                        if streak == 0:
+                            streak_start = t
+                        streak += 1
+                    if streak_start is not None and (t - streak_start) > 9.0:
+                        streak = 0
+                        streak_start = None
+
+                last_angle = angle
+                last_t = t
+
+                if streak >= 3 and streak_start is not None and (t - streak_start) <= 9.0:
+                    events.append({"t": t, "type": "pass_streak", "score": streak})
+                    cooldown_until = t + 8.0
+                    last_angle = None
+                    last_t = None
+                    streak = 0
+                    streak_start = None
+
+            type_weight = {"shot": 3, "penalty_speed": 2, "pass_streak": 1}
+            ranked = sorted(
+                events,
+                key=lambda e: (type_weight.get(str(e.get("type")), 0), float(e.get("score", 0.0))),
+                reverse=True,
+            )
+            chosen: list[dict[str, Any]] = []
+            for e in ranked:
+                t = float(e.get("t", 0.0))
+                if any(abs(t - float(c.get("t", 0.0))) < 5.0 for c in chosen):
+                    continue
+                chosen.append(e)
+                if len(chosen) >= 10:
                     break
+            chosen.sort(key=lambda e: float(e.get("t", 0.0)))
 
             segments: list[ClipSegment] = []
-            for t, s in chosen:
-                start_s = _clamp(t - 3.0, 0.0, max(0.0, duration - 0.5))
-                end_s = _clamp(t + 4.5, start_s + 0.3, max(0.3, duration))
+            for e in chosen:
+                t = float(e.get("t", 0.0))
+                typ = str(e.get("type", ""))
+                if typ == "shot":
+                    start_s = _clamp(t - 5.0, 0.0, max(0.0, duration - 0.5))
+                    end_s = _clamp(t + 6.0, start_s + 0.3, max(0.3, duration))
+                    label = "射门"
+                elif typ == "penalty_speed":
+                    start_s = _clamp(t - 4.0, 0.0, max(0.0, duration - 0.5))
+                    end_s = _clamp(t + 5.0, start_s + 0.3, max(0.3, duration))
+                    label = "禁区内高速球"
+                elif typ == "pass_streak":
+                    start_s = _clamp(t - 6.0, 0.0, max(0.0, duration - 0.5))
+                    end_s = _clamp(t + 8.0, start_s + 0.3, max(0.3, duration))
+                    count = int(e.get("score", 0) or 0) + 1
+                    label = f"连续传导 · {count}"
+                else:
+                    start_s = _clamp(t - 3.0, 0.0, max(0.0, duration - 0.5))
+                    end_s = _clamp(t + 4.5, start_s + 0.3, max(0.3, duration))
+                    label = "精彩瞬间"
+
                 segments.append(
                     ClipSegment(
                         id=f"seg_{uuid.uuid4().hex[:10]}",
                         start_s=round(float(start_s), 3),
                         end_s=round(float(end_s), 3),
-                        label=f"精彩瞬间 · {round(float(s), 1)}m/s",
+                        label=label,
                     )
                 )
 
@@ -683,44 +785,7 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
             payload = dict(job)
         return ClipJobStatus(**payload)
 
-    def _draw_pitch_overlay(frame: Any, t_s: float, track: list[dict[str, Any]]) -> Any:
-        import bisect
-
-        import cv2
-
-        if frame is None:
-            return frame
-        h, w = frame.shape[:2]
-        if h <= 0 or w <= 0:
-            return frame
-
-        overlay_w = max(220, int(w * 0.26))
-        overlay_h = int(overlay_w * (68 / 105))
-        pad = max(10, int(w * 0.015))
-        x0 = w - overlay_w - pad
-        y0 = pad
-
-        cv2.rectangle(frame, (x0 - 2, y0 - 2), (x0 + overlay_w + 2, y0 + overlay_h + 2), (0, 0, 0), -1)
-        cv2.rectangle(frame, (x0, y0), (x0 + overlay_w, y0 + overlay_h), (20, 90, 20), -1)
-        cv2.rectangle(frame, (x0, y0), (x0 + overlay_w, y0 + overlay_h), (245, 245, 245), 2)
-        cv2.line(frame, (x0 + overlay_w // 2, y0), (x0 + overlay_w // 2, y0 + overlay_h), (245, 245, 245), 1)
-        cv2.circle(frame, (x0 + overlay_w // 2, y0 + overlay_h // 2), max(10, overlay_w // 14), (245, 245, 245), 1)
-
-        if not track:
-            return frame
-        times = [float(item.get("t_s", 0.0)) for item in track]
-        i = bisect.bisect_left(times, float(t_s))
-        i = max(0, min(len(track) - 1, i))
-        item = track[i]
-        x_m = float(item.get("x_m", 0.0))
-        y_m = float(item.get("y_m", 0.0))
-
-        px = x0 + int(_clamp(x_m / 105.0, 0.0, 1.0) * overlay_w)
-        py = y0 + int(_clamp(y_m / 68.0, 0.0, 1.0) * overlay_h)
-        cv2.circle(frame, (px, py), max(4, overlay_w // 40), (0, 220, 255), -1)
-        return frame
-
-    async def _export_job(job_id: str, resolution: str, include_pitch: bool) -> None:
+    async def _export_job(job_id: str, resolution: str) -> None:
         import math
 
         import cv2
@@ -732,7 +797,6 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
             job["message"] = "导出中..."
             video_path = Path(job["video_path"])
             segments = list(job.get("segments") or [])
-            track = list(job.get("ball_track") or [])
 
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -792,9 +856,6 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
                     ok, frame = cap.read()
                     if not ok:
                         break
-                    t_s = frame_idx / fps
-                    if include_pitch:
-                        frame = _draw_pitch_overlay(frame, t_s, track)
                     if frame.shape[1] != out_w or frame.shape[0] != out_h:
                         frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
                     writer.write(frame)
@@ -818,14 +879,13 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
 
     class ExportRequest(BaseModel):
         resolution: str = "source"
-        include_pitch: bool = False
 
     @app.post("/api/clip/jobs/{job_id}/export")
     async def clip_job_export(job_id: str, request: ExportRequest) -> ClipJobStatus:
         async with app.state.clip_jobs_lock:
             job = _resolve_job_or_404(job_id)
             payload = dict(job)
-        asyncio.create_task(_export_job(job_id, str(request.resolution), bool(request.include_pitch)))
+        asyncio.create_task(_export_job(job_id, str(request.resolution)))
         return ClipJobStatus(**payload)
 
     @app.get("/api/clip/jobs/{job_id}/export")
