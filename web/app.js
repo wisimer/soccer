@@ -1,3 +1,4 @@
+function legacyGameApp() {
 const pitchLength = 105;
 const pitchWidth = 68;
 
@@ -1722,3 +1723,712 @@ async function bootstrap() {
 }
 
 bootstrap();
+}
+
+(function () {
+  const uploadView = document.getElementById("uploadView");
+  const editorView = document.getElementById("editorView");
+  if (!uploadView || !editorView) {
+    return;
+  }
+
+  const fileInput = document.getElementById("fileInput");
+  const uploadBtn = document.getElementById("uploadBtn");
+  const uploadProgress = document.getElementById("uploadProgress");
+  const uploadStatus = document.getElementById("uploadStatus");
+
+  const backToUpload = document.getElementById("backToUpload");
+  const jobText = document.getElementById("jobText");
+
+  const videoEl = document.getElementById("video");
+  const timelineEl = document.getElementById("timeline");
+  const segmentsListEl = document.getElementById("segmentsList");
+  const addSegmentBtn = document.getElementById("addSegmentBtn");
+  const saveSegmentsBtn = document.getElementById("saveSegmentsBtn");
+  const exportBtn = document.getElementById("exportBtn");
+  const exportStatusEl = document.getElementById("exportStatus");
+  const downloadLinkEl = document.getElementById("downloadLink");
+  const resolutionEl = document.getElementById("resolution");
+  const includePitchEl = document.getElementById("includePitch");
+  const togglePitchEl = document.getElementById("togglePitch");
+  const pitchCanvas = document.getElementById("pitchCanvas");
+  const pitchCtx = pitchCanvas ? pitchCanvas.getContext("2d") : null;
+
+  function clamp(v, lo, hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function fmtTime(sec) {
+    const s = Math.max(0, Number(sec) || 0);
+    const m = Math.floor(s / 60);
+    const r = s - m * 60;
+    const mm = String(m).padStart(2, "0");
+    const ss = String(Math.floor(r)).padStart(2, "0");
+    const ms = String(Math.floor((r - Math.floor(r)) * 10));
+    return `${mm}:${ss}.${ms}`;
+  }
+
+  function uid(prefix) {
+    return `${prefix}_${Math.random().toString(36).slice(2, 10)}${Math.random().toString(36).slice(2, 6)}`;
+  }
+
+  function parseJobId() {
+    const params = new URLSearchParams(window.location.search || "");
+    const job = params.get("job");
+    return job ? String(job) : "";
+  }
+
+  function setJobId(jobId) {
+    const url = new URL(window.location.href);
+    if (jobId) {
+      url.searchParams.set("job", jobId);
+    } else {
+      url.searchParams.delete("job");
+    }
+    window.history.pushState({}, "", url.toString());
+  }
+
+  async function apiJson(url, init) {
+    const res = await fetch(url, {
+      ...init,
+      headers: { "Content-Type": "application/json", ...(init && init.headers ? init.headers : {}) },
+    });
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch (_e) {
+      data = null;
+    }
+    if (!res.ok) {
+      const detail = data && data.detail ? data.detail : text || `HTTP ${res.status}`;
+      throw new Error(detail);
+    }
+    return data;
+  }
+
+  function showUpload() {
+    uploadView.classList.remove("hidden");
+    editorView.classList.add("hidden");
+  }
+
+  function showEditor() {
+    uploadView.classList.add("hidden");
+    editorView.classList.remove("hidden");
+  }
+
+  let currentJobId = "";
+  let currentJob = null;
+  let segments = [];
+  let durationS = 0;
+  let ballTrack = [];
+
+  let polling = null;
+  let exportingPoll = null;
+
+  function normalizeSegments(list) {
+    const items = Array.isArray(list) ? list : [];
+    const normalized = items
+      .map((s) => ({
+        id: s && s.id ? String(s.id) : uid("seg"),
+        start_s: Number(s && s.start_s) || 0,
+        end_s: Number(s && s.end_s) || 0,
+        label: s && s.label ? String(s.label) : "",
+      }))
+      .filter((s) => s.end_s > s.start_s)
+      .sort((a, b) => a.start_s - b.start_s);
+    return normalized;
+  }
+
+  function applyJob(job) {
+    currentJob = job;
+    currentJobId = String(job.job_id || "");
+    durationS = Number(job.duration_s) || durationS || 0;
+    segments = normalizeSegments(job.segments);
+    ballTrack = Array.isArray(job.ball_track) ? job.ball_track : [];
+    jobText.textContent = `job: ${currentJobId}`;
+    downloadLinkEl.classList.add("hidden");
+    downloadLinkEl.href = "#";
+    if (job.export_url && job.export_status === "ready") {
+      downloadLinkEl.href = job.export_url;
+      downloadLinkEl.classList.remove("hidden");
+    }
+    if (typeof job.message === "string" && job.message) {
+      exportStatusEl.textContent = job.message;
+    }
+    renderTimeline();
+    renderSegmentsList();
+  }
+
+  async function fetchJob(jobId) {
+    return await apiJson(`/api/clip/jobs/${encodeURIComponent(jobId)}`, { method: "GET" });
+  }
+
+  function stopPolling() {
+    if (polling) {
+      clearInterval(polling);
+      polling = null;
+    }
+    if (exportingPoll) {
+      clearInterval(exportingPoll);
+      exportingPoll = null;
+    }
+  }
+
+  function startPolling(jobId) {
+    stopPolling();
+    polling = setInterval(async () => {
+      try {
+        const job = await fetchJob(jobId);
+        applyJob(job);
+        if (job.status === "ready" || job.status === "error") {
+          clearInterval(polling);
+          polling = null;
+        }
+      } catch (_e) {
+      }
+    }, 800);
+  }
+
+  async function openEditor(jobId, initialJob) {
+    setJobId(jobId);
+    showEditor();
+    jobText.textContent = `job: ${jobId}`;
+    if (videoEl) {
+      videoEl.src = `/api/clip/jobs/${encodeURIComponent(jobId)}/video`;
+    }
+    if (initialJob) {
+      applyJob(initialJob);
+    } else {
+      applyJob(await fetchJob(jobId));
+    }
+    startPolling(jobId);
+  }
+
+  function uploadFile(file) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/clip/upload");
+      xhr.responseType = "json";
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable) {
+          const pct = clamp((ev.loaded / ev.total) * 100, 0, 100);
+          uploadProgress.style.width = `${pct.toFixed(1)}%`;
+          uploadStatus.textContent = `上传中 ${pct.toFixed(1)}%`;
+        } else {
+          uploadStatus.textContent = "上传中...";
+        }
+      };
+      xhr.onload = () => {
+        const data = xhr.response;
+        if (xhr.status >= 200 && xhr.status < 300 && data && data.job_id) {
+          resolve(data);
+        } else {
+          const detail = data && data.detail ? data.detail : `HTTP ${xhr.status}`;
+          reject(new Error(detail));
+        }
+      };
+      xhr.onerror = () => reject(new Error("网络错误"));
+      const form = new FormData();
+      form.append("file", file);
+      xhr.send(form);
+    });
+  }
+
+  function pxFromTime(t) {
+    const w = timelineEl.clientWidth || 1;
+    const ratio = durationS > 0 ? clamp(t / durationS, 0, 1) : 0;
+    return ratio * w;
+  }
+
+  function timeFromPx(px) {
+    const w = timelineEl.clientWidth || 1;
+    const ratio = clamp(px / w, 0, 1);
+    return ratio * (durationS || 0);
+  }
+
+  function ensurePlayhead() {
+    let el = timelineEl.querySelector(".playhead");
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "playhead";
+      timelineEl.appendChild(el);
+    }
+    return el;
+  }
+
+  function renderTimeline() {
+    if (!timelineEl) {
+      return;
+    }
+    timelineEl.innerHTML = "";
+    const playhead = ensurePlayhead();
+    playhead.style.left = `${pxFromTime(videoEl && Number.isFinite(videoEl.currentTime) ? videoEl.currentTime : 0)}px`;
+    for (const seg of segments) {
+      const left = pxFromTime(seg.start_s);
+      const right = pxFromTime(seg.end_s);
+      const el = document.createElement("div");
+      el.className = "seg";
+      el.dataset.id = seg.id;
+      el.style.left = `${left}px`;
+      el.style.width = `${Math.max(16, right - left)}px`;
+
+      const leftHandle = document.createElement("div");
+      leftHandle.className = "handle left";
+      const rightHandle = document.createElement("div");
+      rightHandle.className = "handle right";
+      const label = document.createElement("div");
+      label.className = "label";
+      label.textContent = seg.label || "片段";
+      el.appendChild(leftHandle);
+      el.appendChild(label);
+      el.appendChild(rightHandle);
+      timelineEl.appendChild(el);
+    }
+  }
+
+  function renderSegmentsList() {
+    if (!segmentsListEl) {
+      return;
+    }
+    segmentsListEl.innerHTML = "";
+    for (const seg of segments) {
+      const row = document.createElement("div");
+      row.className = "segment-item";
+      row.dataset.id = seg.id;
+
+      const main = document.createElement("div");
+      main.className = "segment-main";
+
+      const top = document.createElement("div");
+      top.className = "segment-row";
+      const labelInput = document.createElement("input");
+      labelInput.className = "input wide";
+      labelInput.value = seg.label || "";
+      labelInput.placeholder = "片段名称";
+      labelInput.addEventListener("input", () => {
+        seg.label = String(labelInput.value || "");
+        renderTimeline();
+      });
+      top.appendChild(labelInput);
+
+      const mid = document.createElement("div");
+      mid.className = "segment-row";
+      const startInput = document.createElement("input");
+      startInput.className = "input";
+      startInput.value = String(seg.start_s.toFixed(3));
+      const endInput = document.createElement("input");
+      endInput.className = "input";
+      endInput.value = String(seg.end_s.toFixed(3));
+      const seekBtn = document.createElement("button");
+      seekBtn.className = "btn";
+      seekBtn.textContent = "跳转";
+      seekBtn.addEventListener("click", () => {
+        if (videoEl) {
+          videoEl.currentTime = clamp(seg.start_s, 0, durationS || seg.start_s);
+          videoEl.play();
+        }
+      });
+
+      function applyInputs() {
+        const s = Number(startInput.value);
+        const e = Number(endInput.value);
+        if (!Number.isFinite(s) || !Number.isFinite(e)) {
+          return;
+        }
+        seg.start_s = clamp(s, 0, Math.max(0, (durationS || e) - 0.05));
+        seg.end_s = clamp(e, seg.start_s + 0.05, durationS || e);
+        segments = normalizeSegments(segments);
+        renderTimeline();
+        renderSegmentsList();
+      }
+      startInput.addEventListener("change", applyInputs);
+      endInput.addEventListener("change", applyInputs);
+
+      mid.appendChild(document.createTextNode("start"));
+      mid.appendChild(startInput);
+      mid.appendChild(document.createTextNode("end"));
+      mid.appendChild(endInput);
+      mid.appendChild(seekBtn);
+
+      main.appendChild(top);
+      main.appendChild(mid);
+
+      const actions = document.createElement("div");
+      const del = document.createElement("button");
+      del.className = "btn danger";
+      del.textContent = "删除";
+      del.addEventListener("click", () => {
+        segments = segments.filter((s) => s.id !== seg.id);
+        renderTimeline();
+        renderSegmentsList();
+      });
+      actions.appendChild(del);
+
+      row.appendChild(main);
+      row.appendChild(actions);
+      segmentsListEl.appendChild(row);
+    }
+  }
+
+  let drag = null;
+  function segById(id) {
+    return segments.find((s) => s.id === id) || null;
+  }
+
+  function beginDrag(ev, mode, segId) {
+    const seg = segById(segId);
+    if (!seg) {
+      return;
+    }
+    const rect = timelineEl.getBoundingClientRect();
+    drag = {
+      mode,
+      segId,
+      startX: ev.clientX,
+      rectLeft: rect.left,
+      baseStart: seg.start_s,
+      baseEnd: seg.end_s,
+    };
+    const el = timelineEl.querySelector(`.seg[data-id="${segId}"]`);
+    if (el) {
+      el.classList.add("dragging");
+    }
+    ev.preventDefault();
+  }
+
+  function endDrag() {
+    if (!drag) {
+      return;
+    }
+    const el = timelineEl.querySelector(`.seg[data-id="${drag.segId}"]`);
+    if (el) {
+      el.classList.remove("dragging");
+    }
+    drag = null;
+  }
+
+  function onMove(ev) {
+    if (!drag) {
+      return;
+    }
+    const seg = segById(drag.segId);
+    if (!seg) {
+      endDrag();
+      return;
+    }
+    const dx = ev.clientX - drag.startX;
+    const dt = durationS > 0 ? (dx / (timelineEl.clientWidth || 1)) * durationS : 0;
+    const minLen = 0.2;
+    if (drag.mode === "move") {
+      const len = drag.baseEnd - drag.baseStart;
+      let ns = drag.baseStart + dt;
+      ns = clamp(ns, 0, Math.max(0, durationS - len));
+      seg.start_s = ns;
+      seg.end_s = ns + len;
+    } else if (drag.mode === "left") {
+      seg.start_s = clamp(drag.baseStart + dt, 0, seg.end_s - minLen);
+    } else if (drag.mode === "right") {
+      seg.end_s = clamp(drag.baseEnd + dt, seg.start_s + minLen, durationS || drag.baseEnd + dt);
+    }
+    segments = normalizeSegments(segments);
+    renderTimeline();
+    renderSegmentsList();
+  }
+
+  function onUp() {
+    endDrag();
+  }
+
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+  document.addEventListener("touchmove", (ev) => {
+    if (!drag || !ev.touches || !ev.touches[0]) {
+      return;
+    }
+    onMove({ clientX: ev.touches[0].clientX });
+  });
+  document.addEventListener("touchend", onUp);
+
+  if (timelineEl) timelineEl.addEventListener("mousedown", (ev) => {
+    const segEl = ev.target.closest(".seg");
+    if (!segEl) {
+      const rect = timelineEl.getBoundingClientRect();
+      const t = timeFromPx(ev.clientX - rect.left);
+      if (videoEl && Number.isFinite(t)) {
+        videoEl.currentTime = clamp(t, 0, durationS || t);
+      }
+      return;
+    }
+    const segId = segEl.dataset.id;
+    if (!segId) {
+      return;
+    }
+    const isLeft = ev.target.classList.contains("left");
+    const isRight = ev.target.classList.contains("right");
+    if (isLeft) {
+      beginDrag(ev, "left", segId);
+    } else if (isRight) {
+      beginDrag(ev, "right", segId);
+    } else {
+      beginDrag(ev, "move", segId);
+    }
+  });
+
+  if (timelineEl) timelineEl.addEventListener("touchstart", (ev) => {
+    if (!ev.touches || !ev.touches[0]) {
+      return;
+    }
+    const t = ev.touches[0];
+    const target = document.elementFromPoint(t.clientX, t.clientY);
+    const segEl = target ? target.closest(".seg") : null;
+    if (!segEl) {
+      const rect = timelineEl.getBoundingClientRect();
+      const ts = timeFromPx(t.clientX - rect.left);
+      if (videoEl && Number.isFinite(ts)) {
+        videoEl.currentTime = clamp(ts, 0, durationS || ts);
+      }
+      return;
+    }
+    const segId = segEl.dataset.id;
+    if (!segId) {
+      return;
+    }
+    const isLeft = target.classList && target.classList.contains("left");
+    const isRight = target.classList && target.classList.contains("right");
+    beginDrag({ clientX: t.clientX, preventDefault: () => {} }, isLeft ? "left" : isRight ? "right" : "move", segId);
+  });
+
+  addSegmentBtn.addEventListener("click", () => {
+    const t = videoEl ? Number(videoEl.currentTime) || 0 : 0;
+    const start = clamp(t - 1.2, 0, Math.max(0, (durationS || t + 6) - 0.3));
+    const end = clamp(start + 6.0, start + 0.3, durationS || start + 6.0);
+    segments.push({ id: uid("seg"), start_s: start, end_s: end, label: "新片段" });
+    segments = normalizeSegments(segments);
+    renderTimeline();
+    renderSegmentsList();
+  });
+
+  saveSegmentsBtn.addEventListener("click", async () => {
+    if (!currentJobId) {
+      return;
+    }
+    try {
+      exportStatusEl.textContent = "保存中...";
+      const payload = segments.map((s) => ({
+        id: s.id,
+        start_s: Number(s.start_s),
+        end_s: Number(s.end_s),
+        label: s.label || null,
+      }));
+      const job = await apiJson(`/api/clip/jobs/${encodeURIComponent(currentJobId)}/segments`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      applyJob(job);
+      exportStatusEl.textContent = "已保存片段";
+    } catch (e) {
+      exportStatusEl.textContent = `保存失败：${e.message || e}`;
+    }
+  });
+
+  exportBtn.addEventListener("click", async () => {
+    if (!currentJobId) {
+      return;
+    }
+    downloadLinkEl.classList.add("hidden");
+    downloadLinkEl.href = "#";
+    try {
+      exportStatusEl.textContent = "开始导出...";
+      await apiJson(`/api/clip/jobs/${encodeURIComponent(currentJobId)}/export`, {
+        method: "POST",
+        body: JSON.stringify({
+          resolution: String(resolutionEl.value || "source"),
+          include_pitch: includePitchEl.value === "1",
+        }),
+      });
+      if (exportingPoll) {
+        clearInterval(exportingPoll);
+      }
+      exportingPoll = setInterval(async () => {
+        try {
+          const job = await fetchJob(currentJobId);
+          applyJob(job);
+          if (job.export_status === "ready" && job.export_url) {
+            exportStatusEl.textContent = "导出完成";
+            downloadLinkEl.href = job.export_url;
+            downloadLinkEl.classList.remove("hidden");
+            clearInterval(exportingPoll);
+            exportingPoll = null;
+          } else if (job.export_status === "error") {
+            exportStatusEl.textContent = job.message || "导出失败";
+            clearInterval(exportingPoll);
+            exportingPoll = null;
+          } else {
+            exportStatusEl.textContent = job.message || "导出中...";
+          }
+        } catch (_e) {
+        }
+      }, 900);
+    } catch (e) {
+      exportStatusEl.textContent = `导出失败：${e.message || e}`;
+    }
+  });
+
+  togglePitchEl.addEventListener("change", () => {
+    if (!pitchCanvas) {
+      return;
+    }
+    pitchCanvas.classList.toggle("hidden", !togglePitchEl.checked);
+  });
+
+  function pickBallAt(t) {
+    const arr = ballTrack;
+    if (!arr || arr.length === 0) {
+      return null;
+    }
+    let lo = 0;
+    let hi = arr.length - 1;
+    const target = Number(t) || 0;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (Number(arr[mid].t_s) < target) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return arr[lo] || arr[arr.length - 1];
+  }
+
+  function pitchDraw(now) {
+    if (!pitchCtx || !pitchCanvas || !togglePitchEl.checked) {
+      requestAnimationFrame(pitchDraw);
+      return;
+    }
+    const w = pitchCanvas.width;
+    const h = pitchCanvas.height;
+    pitchCtx.clearRect(0, 0, w, h);
+    pitchCtx.fillStyle = "rgba(20, 90, 20, 0.9)";
+    pitchCtx.fillRect(0, 0, w, h);
+    pitchCtx.strokeStyle = "rgba(245,245,245,0.9)";
+    pitchCtx.lineWidth = 2;
+    pitchCtx.strokeRect(6, 6, w - 12, h - 12);
+    pitchCtx.lineWidth = 1;
+    pitchCtx.beginPath();
+    pitchCtx.moveTo(w / 2, 6);
+    pitchCtx.lineTo(w / 2, h - 6);
+    pitchCtx.stroke();
+    pitchCtx.beginPath();
+    pitchCtx.arc(w / 2, h / 2, Math.min(w, h) * 0.12, 0, Math.PI * 2);
+    pitchCtx.stroke();
+
+    const t = videoEl ? Number(videoEl.currentTime) || 0 : 0;
+    const ball = pickBallAt(t);
+    if (ball) {
+      const x = clamp((Number(ball.x_m) || 0) / 105, 0, 1);
+      const y = clamp((Number(ball.y_m) || 0) / 68, 0, 1);
+      const px = 6 + x * (w - 12);
+      const py = 6 + y * (h - 12);
+
+      pitchCtx.fillStyle = "rgba(0, 220, 255, 0.95)";
+      pitchCtx.beginPath();
+      pitchCtx.arc(px, py, Math.max(4, Math.min(w, h) * 0.03), 0, Math.PI * 2);
+      pitchCtx.fill();
+
+      const idx = Math.max(0, (ballTrack || []).findIndex((v) => v === ball));
+      if (idx > 0 && ballTrack[idx - 1]) {
+        const prev = ballTrack[idx - 1];
+        const dt = (Number(ball.t_s) || 0) - (Number(prev.t_s) || 0);
+        if (dt > 1e-3) {
+          const vx = ((Number(ball.x_m) || 0) - (Number(prev.x_m) || 0)) / dt;
+          const vy = ((Number(ball.y_m) || 0) - (Number(prev.y_m) || 0)) / dt;
+          const speed = Math.sqrt(vx * vx + vy * vy);
+          const scale = clamp(speed / 15, 0, 1) * (Math.min(w, h) * 0.22);
+          pitchCtx.strokeStyle = "rgba(255, 220, 0, 0.9)";
+          pitchCtx.lineWidth = 2;
+          pitchCtx.beginPath();
+          pitchCtx.moveTo(px, py);
+          pitchCtx.lineTo(px + vx * scale, py + vy * scale);
+          pitchCtx.stroke();
+          pitchCtx.fillStyle = "rgba(255,255,255,0.9)";
+          pitchCtx.font = "12px system-ui, sans-serif";
+          pitchCtx.fillText(`${speed.toFixed(1)} m/s`, 10, h - 10);
+        }
+      }
+    }
+
+    requestAnimationFrame(pitchDraw);
+  }
+
+  requestAnimationFrame(pitchDraw);
+
+  function updatePlayhead() {
+    if (!timelineEl) {
+      return;
+    }
+    const playhead = timelineEl.querySelector(".playhead");
+    if (!playhead) {
+      return;
+    }
+    const t = videoEl ? Number(videoEl.currentTime) || 0 : 0;
+    playhead.style.left = `${pxFromTime(t)}px`;
+  }
+
+  if (videoEl) {
+    videoEl.addEventListener("timeupdate", updatePlayhead);
+    videoEl.addEventListener("loadedmetadata", () => {
+      if (!durationS && Number.isFinite(videoEl.duration)) {
+        durationS = Number(videoEl.duration) || 0;
+      }
+      renderTimeline();
+      renderSegmentsList();
+    });
+  }
+
+  window.addEventListener("resize", () => {
+    renderTimeline();
+  });
+
+  async function boot() {
+    const jobId = parseJobId();
+    if (jobId) {
+      try {
+        await openEditor(jobId);
+      } catch (_e) {
+        setJobId("");
+        showUpload();
+      }
+      return;
+    }
+    showUpload();
+  }
+
+  backToUpload.addEventListener("click", () => {
+    stopPolling();
+    setJobId("");
+    showUpload();
+  });
+
+  uploadBtn.addEventListener("click", async () => {
+    if (!fileInput || !fileInput.files || !fileInput.files[0]) {
+      uploadStatus.textContent = "请选择视频文件";
+      return;
+    }
+    const file = fileInput.files[0];
+    uploadProgress.style.width = "0%";
+    uploadStatus.textContent = "开始上传...";
+    try {
+      uploadBtn.disabled = true;
+      const res = await uploadFile(file);
+      uploadStatus.textContent = "上传完成，开始解析...";
+      await openEditor(res.job_id, res);
+    } catch (e) {
+      uploadStatus.textContent = `上传失败：${e.message || e}`;
+    } finally {
+      uploadBtn.disabled = false;
+    }
+  });
+
+  boot();
+})();

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -12,10 +13,10 @@ from typing import Any, TypeVar
 
 import uvicorn
 import yaml
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from .game_engine import GameEngine
 from .pipeline import SCHEMA_VERSION, StreamProcessor
@@ -81,6 +82,30 @@ class SkillActionRequest(BaseModel):
     team: str
     skill: str
     client_event_id: str | None = None
+
+
+class ClipSegment(BaseModel):
+    id: str | None = None
+    start_s: float
+    end_s: float
+    label: str | None = None
+
+
+class ClipJobStatus(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    job_id: str
+    status: str
+    progress: float = 0.0
+    message: str | None = None
+    video_url: str | None = None
+    duration_s: float | None = None
+    width: int | None = None
+    height: int | None = None
+    segments: list[ClipSegment] = Field(default_factory=list)
+    ball_track: list[dict[str, Any]] = Field(default_factory=list)
+    export_url: str | None = None
+    export_status: str | None = None
 
 
 async def _forward_loop(queue: asyncio.Queue[dict[str, Any]], hub: ConnectionHub) -> None:
@@ -196,6 +221,21 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
     local_video_file = _resolve_local_video_file(video_source, base_dir)
     preview_url = _video_preview_url(local_video_file)
 
+    uploads_dir = base_dir / "uploads"
+    exports_dir = base_dir / "exports"
+
+    def _ensure_dir(path: Path) -> None:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+    def _now_ms() -> int:
+        return int(time.time() * 1000)
+
+    def _clamp(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, v))
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=5)
@@ -231,6 +271,14 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
         app.state.game_engine = game_engine
         app.state.processor = processor
         app.state.runtime = _runtime_snapshot(runtime_settings, detector, tracker, projector, local_video_file)
+
+        _ensure_dir(uploads_dir)
+        _ensure_dir(exports_dir)
+        app.state.clip_jobs: dict[str, dict[str, Any]] = {}
+        app.state.clip_jobs_lock = asyncio.Lock()
+        app.state.clip_detector = detector
+        app.state.clip_detector_lock = asyncio.Lock()
+        app.state.clip_projector = build_projector()
 
         try:
             yield
@@ -340,6 +388,454 @@ def create_app(video_source: str, target_fps: int, runtime_settings: RuntimeSett
             pass
         finally:
             await hub.disconnect(ws)
+
+    async def _analyze_job(job_id: str) -> None:
+        import math
+
+        import cv2
+
+        async with app.state.clip_jobs_lock:
+            job = app.state.clip_jobs.get(job_id)
+        if job is None:
+            return
+
+        job["status"] = "analyzing"
+        job["progress"] = 0.0
+        job["message"] = "解析中..."
+        job["ball_track"] = []
+        job["segments"] = []
+        job["export_status"] = None
+        job["export_url"] = None
+
+        video_path = Path(job["video_path"])
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            job["status"] = "error"
+            job["message"] = "无法打开视频文件"
+            return
+
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if not math.isfinite(fps) or fps <= 1e-3:
+                fps = 25.0
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            duration_s = (frame_count / fps) if frame_count > 0 else None
+
+            job["fps"] = fps
+            job["frame_count"] = frame_count
+            job["width"] = width if width > 0 else None
+            job["height"] = height if height > 0 else None
+            job["duration_s"] = duration_s
+
+            sample_fps = 8.0
+            step = max(1, int(round(fps / sample_fps)))
+            detector = app.state.clip_detector
+            projector = app.state.clip_projector
+            if width > 0 and height > 0:
+                projector.update(width, height)
+
+            batch_frames: list[Any] = []
+            batch_ts_s: list[float] = []
+            processed_samples = 0
+            total_samples = (frame_count // step) if frame_count > 0 else 0
+            total_samples = max(1, total_samples)
+
+            async def flush_batch() -> None:
+                nonlocal processed_samples
+                if not batch_frames:
+                    return
+                frames = list(batch_frames)
+                ts_s = list(batch_ts_s)
+                batch_frames.clear()
+                batch_ts_s.clear()
+
+                async with app.state.clip_detector_lock:
+                    detections_batch = await asyncio.to_thread(detector.detect_many, frames)
+
+                for t_s, detections in zip(ts_s, detections_batch):
+                    best = None
+                    best_conf = -1.0
+                    for det in detections:
+                        if getattr(det, "kind", None) != "ball":
+                            continue
+                        conf = float(getattr(det, "confidence", 0.0) or 0.0)
+                        if conf > best_conf:
+                            best_conf = conf
+                            best = det
+                    if best is None:
+                        continue
+                    cx_px = float(best.x + best.w * 0.5)
+                    cy_px = float(best.y + best.h * 0.5)
+                    x_m, y_m = projector.to_pitch(cx_px, cy_px)
+                    job["ball_track"].append(
+                        {
+                            "t_s": round(float(t_s), 3),
+                            "x_m": round(float(x_m), 3),
+                            "y_m": round(float(y_m), 3),
+                            "conf": round(float(best_conf), 3),
+                        }
+                    )
+                processed_samples += len(ts_s)
+                job["progress"] = _clamp(processed_samples / total_samples, 0.0, 0.98)
+
+            idx = 0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if idx % step == 0:
+                    t_s = idx / fps
+                    batch_frames.append(frame)
+                    batch_ts_s.append(t_s)
+                    if len(batch_frames) >= max(1, int(getattr(detector, "batch_size", 1))):
+                        await flush_batch()
+                idx += 1
+
+            await flush_batch()
+
+            track = job["ball_track"]
+            track.sort(key=lambda item: float(item.get("t_s", 0.0)))
+            speeds: list[tuple[float, float]] = []
+            for i in range(1, len(track)):
+                t0 = float(track[i - 1]["t_s"])
+                t1 = float(track[i]["t_s"])
+                dt = t1 - t0
+                if dt <= 1e-6:
+                    continue
+                dx = float(track[i]["x_m"]) - float(track[i - 1]["x_m"])
+                dy = float(track[i]["y_m"]) - float(track[i - 1]["y_m"])
+                speed = math.sqrt(dx * dx + dy * dy) / dt
+                speeds.append((t1, speed))
+
+            peaks: list[tuple[float, float]] = []
+            for i in range(1, len(speeds) - 1):
+                t, s = speeds[i]
+                if s > speeds[i - 1][1] and s >= speeds[i + 1][1]:
+                    peaks.append((t, s))
+            peaks.sort(key=lambda item: item[1], reverse=True)
+
+            duration = float(duration_s or (speeds[-1][0] if speeds else 0.0) or 0.0)
+            min_gap_s = 6.0
+            chosen: list[tuple[float, float]] = []
+            for t, s in peaks:
+                if s < 4.2:
+                    continue
+                if all(abs(t - prev_t) >= min_gap_s for prev_t, _ in chosen):
+                    chosen.append((t, s))
+                if len(chosen) >= 8:
+                    break
+
+            segments: list[ClipSegment] = []
+            for t, s in chosen:
+                start_s = _clamp(t - 3.0, 0.0, max(0.0, duration - 0.5))
+                end_s = _clamp(t + 4.5, start_s + 0.3, max(0.3, duration))
+                segments.append(
+                    ClipSegment(
+                        id=f"seg_{uuid.uuid4().hex[:10]}",
+                        start_s=round(float(start_s), 3),
+                        end_s=round(float(end_s), 3),
+                        label=f"精彩瞬间 · {round(float(s), 1)}m/s",
+                    )
+                )
+
+            segments.sort(key=lambda seg: seg.start_s)
+            merged: list[ClipSegment] = []
+            for seg in segments:
+                if not merged:
+                    merged.append(seg)
+                    continue
+                prev = merged[-1]
+                if seg.start_s <= prev.end_s + 0.35:
+                    merged[-1] = ClipSegment(
+                        id=prev.id,
+                        start_s=prev.start_s,
+                        end_s=max(prev.end_s, seg.end_s),
+                        label=prev.label,
+                    )
+                else:
+                    merged.append(seg)
+
+            if not merged and duration > 0:
+                start_s = _clamp(duration * 0.4, 0.0, max(0.0, duration - 0.5))
+                end_s = _clamp(start_s + min(8.0, duration * 0.2 + 3.0), start_s + 0.3, duration)
+                merged.append(
+                    ClipSegment(
+                        id=f"seg_{uuid.uuid4().hex[:10]}",
+                        start_s=round(float(start_s), 3),
+                        end_s=round(float(end_s), 3),
+                        label="精彩瞬间",
+                    )
+                )
+
+            job["segments"] = [seg.model_dump() for seg in merged]
+            job["status"] = "ready"
+            job["progress"] = 1.0
+            job["message"] = "解析完成"
+        except Exception as exc:
+            job["status"] = "error"
+            job["message"] = f"解析失败：{exc}"
+        finally:
+            cap.release()
+
+    def _resolve_job_or_404(job_id: str) -> dict[str, Any]:
+        job_id = str(job_id or "").strip()
+        if not job_id:
+            raise HTTPException(status_code=400, detail="job_id is required")
+        job = app.state.clip_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return job
+
+    @app.post("/api/clip/upload")
+    async def clip_upload(file: UploadFile = File(...)) -> ClipJobStatus:
+        if file is None or not file.filename:
+            raise HTTPException(status_code=400, detail="file is required")
+        suffix = Path(file.filename).suffix.lower()
+        if suffix not in {".mp4", ".mov", ".m4v", ".avi", ".mkv"}:
+            suffix = ".mp4"
+        job_id = f"job_{uuid.uuid4().hex[:12]}"
+        target_path = uploads_dir / f"{job_id}{suffix}"
+
+        _ensure_dir(uploads_dir)
+        try:
+            with target_path.open("wb") as fp:
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    fp.write(chunk)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"save upload failed: {exc}") from exc
+
+        job = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0.0,
+            "message": "等待解析...",
+            "video_path": str(target_path),
+            "video_url": f"/api/clip/jobs/{job_id}/video",
+            "duration_s": None,
+            "width": None,
+            "height": None,
+            "segments": [],
+            "ball_track": [],
+            "export_status": None,
+            "export_url": None,
+            "created_at_ms": _now_ms(),
+        }
+
+        async with app.state.clip_jobs_lock:
+            app.state.clip_jobs[job_id] = job
+
+        asyncio.create_task(_analyze_job(job_id))
+
+        return ClipJobStatus(
+            job_id=job_id,
+            status=str(job["status"]),
+            progress=float(job["progress"]),
+            message=str(job["message"]),
+            video_url=str(job["video_url"]),
+        )
+
+    @app.get("/api/clip/jobs/{job_id}")
+    async def clip_job(job_id: str) -> ClipJobStatus:
+        async with app.state.clip_jobs_lock:
+            job = _resolve_job_or_404(job_id)
+            payload = dict(job)
+        return ClipJobStatus(**payload)
+
+    @app.get("/api/clip/jobs/{job_id}/video")
+    async def clip_job_video(job_id: str) -> FileResponse:
+        async with app.state.clip_jobs_lock:
+            job = _resolve_job_or_404(job_id)
+            path = Path(job["video_path"])
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="Video not found")
+        return FileResponse(path)
+
+    @app.put("/api/clip/jobs/{job_id}/segments")
+    async def clip_job_update_segments(job_id: str, segments: list[ClipSegment]) -> ClipJobStatus:
+        async with app.state.clip_jobs_lock:
+            job = _resolve_job_or_404(job_id)
+            duration = job.get("duration_s")
+            duration_f = float(duration) if duration is not None else None
+            normalized: list[dict[str, Any]] = []
+            for seg in segments:
+                start_s = float(seg.start_s)
+                end_s = float(seg.end_s)
+                if duration_f is not None and duration_f > 0:
+                    start_s = _clamp(start_s, 0.0, max(0.0, duration_f - 0.05))
+                    end_s = _clamp(end_s, start_s + 0.05, duration_f)
+                if end_s <= start_s:
+                    continue
+                normalized.append(
+                    ClipSegment(
+                        id=seg.id or f"seg_{uuid.uuid4().hex[:10]}",
+                        start_s=round(start_s, 3),
+                        end_s=round(end_s, 3),
+                        label=seg.label,
+                    ).model_dump()
+                )
+            normalized.sort(key=lambda item: float(item["start_s"]))
+            job["segments"] = normalized
+            payload = dict(job)
+        return ClipJobStatus(**payload)
+
+    def _draw_pitch_overlay(frame: Any, t_s: float, track: list[dict[str, Any]]) -> Any:
+        import bisect
+
+        import cv2
+
+        if frame is None:
+            return frame
+        h, w = frame.shape[:2]
+        if h <= 0 or w <= 0:
+            return frame
+
+        overlay_w = max(220, int(w * 0.26))
+        overlay_h = int(overlay_w * (68 / 105))
+        pad = max(10, int(w * 0.015))
+        x0 = w - overlay_w - pad
+        y0 = pad
+
+        cv2.rectangle(frame, (x0 - 2, y0 - 2), (x0 + overlay_w + 2, y0 + overlay_h + 2), (0, 0, 0), -1)
+        cv2.rectangle(frame, (x0, y0), (x0 + overlay_w, y0 + overlay_h), (20, 90, 20), -1)
+        cv2.rectangle(frame, (x0, y0), (x0 + overlay_w, y0 + overlay_h), (245, 245, 245), 2)
+        cv2.line(frame, (x0 + overlay_w // 2, y0), (x0 + overlay_w // 2, y0 + overlay_h), (245, 245, 245), 1)
+        cv2.circle(frame, (x0 + overlay_w // 2, y0 + overlay_h // 2), max(10, overlay_w // 14), (245, 245, 245), 1)
+
+        if not track:
+            return frame
+        times = [float(item.get("t_s", 0.0)) for item in track]
+        i = bisect.bisect_left(times, float(t_s))
+        i = max(0, min(len(track) - 1, i))
+        item = track[i]
+        x_m = float(item.get("x_m", 0.0))
+        y_m = float(item.get("y_m", 0.0))
+
+        px = x0 + int(_clamp(x_m / 105.0, 0.0, 1.0) * overlay_w)
+        py = y0 + int(_clamp(y_m / 68.0, 0.0, 1.0) * overlay_h)
+        cv2.circle(frame, (px, py), max(4, overlay_w // 40), (0, 220, 255), -1)
+        return frame
+
+    async def _export_job(job_id: str, resolution: str, include_pitch: bool) -> None:
+        import math
+
+        import cv2
+
+        async with app.state.clip_jobs_lock:
+            job = _resolve_job_or_404(job_id)
+            job["export_status"] = "exporting"
+            job["export_url"] = None
+            job["message"] = "导出中..."
+            video_path = Path(job["video_path"])
+            segments = list(job.get("segments") or [])
+            track = list(job.get("ball_track") or [])
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            async with app.state.clip_jobs_lock:
+                job = _resolve_job_or_404(job_id)
+                job["export_status"] = "error"
+                job["message"] = "无法打开视频文件（导出）"
+            return
+
+        try:
+            src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if not math.isfinite(fps) or fps <= 1e-3:
+                fps = float(job.get("fps") or 25.0)
+            if src_w <= 0 or src_h <= 0:
+                src_w = int(job.get("width") or 1280)
+                src_h = int(job.get("height") or 720)
+
+            if resolution == "1080p":
+                out_h = 1080
+            elif resolution == "720p":
+                out_h = 720
+            elif resolution == "source":
+                out_h = src_h
+            else:
+                out_h = src_h
+            out_w = int(round(out_h * (src_w / max(1, src_h))))
+            out_w = max(2, out_w)
+
+            _ensure_dir(exports_dir)
+            out_path = exports_dir / f"{job_id}_highlights_{out_w}x{out_h}.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(out_path), fourcc, fps, (out_w, out_h))
+            if not writer.isOpened():
+                raise RuntimeError("VideoWriter init failed")
+
+            def iter_segments() -> list[tuple[int, int]]:
+                segs = []
+                for seg in segments:
+                    start_s = float(seg.get("start_s", 0.0))
+                    end_s = float(seg.get("end_s", 0.0))
+                    if end_s <= start_s:
+                        continue
+                    segs.append((int(start_s * fps), int(end_s * fps)))
+                segs.sort(key=lambda item: item[0])
+                return segs
+
+            seg_frames = iter_segments()
+            if not seg_frames:
+                seg_frames = [(0, int(10 * fps))]
+
+            for start_f, end_f in seg_frames:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, start_f))
+                frame_idx = max(0, start_f)
+                while frame_idx < end_f:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    t_s = frame_idx / fps
+                    if include_pitch:
+                        frame = _draw_pitch_overlay(frame, t_s, track)
+                    if frame.shape[1] != out_w or frame.shape[0] != out_h:
+                        frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                    writer.write(frame)
+                    frame_idx += 1
+
+            writer.release()
+
+            async with app.state.clip_jobs_lock:
+                job = _resolve_job_or_404(job_id)
+                job["export_status"] = "ready"
+                job["export_url"] = f"/api/clip/jobs/{job_id}/export"
+                job["export_path"] = str(out_path)
+                job["message"] = "导出完成"
+        except Exception as exc:
+            async with app.state.clip_jobs_lock:
+                job = _resolve_job_or_404(job_id)
+                job["export_status"] = "error"
+                job["message"] = f"导出失败：{exc}"
+        finally:
+            cap.release()
+
+    class ExportRequest(BaseModel):
+        resolution: str = "source"
+        include_pitch: bool = False
+
+    @app.post("/api/clip/jobs/{job_id}/export")
+    async def clip_job_export(job_id: str, request: ExportRequest) -> ClipJobStatus:
+        async with app.state.clip_jobs_lock:
+            job = _resolve_job_or_404(job_id)
+            payload = dict(job)
+        asyncio.create_task(_export_job(job_id, str(request.resolution), bool(request.include_pitch)))
+        return ClipJobStatus(**payload)
+
+    @app.get("/api/clip/jobs/{job_id}/export")
+    async def clip_job_export_download(job_id: str) -> FileResponse:
+        async with app.state.clip_jobs_lock:
+            job = _resolve_job_or_404(job_id)
+            path = Path(job.get("export_path") or "")
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="Export not ready")
+        return FileResponse(path, filename=path.name)
 
     return app
 

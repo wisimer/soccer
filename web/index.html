@@ -3,141 +3,91 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>萌熊 vs 猴子 实时指挥战</title>
+    <title>足球视频一键剪辑</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <main class="layout">
-      <section class="header">
-        <h1>萌熊 vs 猴子 实时指挥战</h1>
-        <p>90 秒快局 · 事件命中触发技能 · 连击冲榜</p>
-        <div class="status-row">
-          <div id="status" class="status">Connecting...</div>
-          <div id="playerBadge" class="player-badge">未加入阵营</div>
+    <main class="page">
+      <header class="topbar">
+        <h1 class="title">足球视频一键剪辑</h1>
+        <div class="subtitle">上传 → 识别 → 剪辑 → 一键导出</div>
+      </header>
+
+      <section id="uploadView" class="card">
+        <h2>上传视频</h2>
+        <div class="upload-row">
+          <input id="fileInput" class="file-input" type="file" accept="video/*" />
+          <button id="uploadBtn" class="btn primary">上传并识别</button>
+        </div>
+        <div class="progress-row">
+          <div class="progress-bar">
+            <div id="uploadProgress" class="progress-inner" style="width: 0%"></div>
+          </div>
+          <div id="uploadStatus" class="muted">等待上传</div>
         </div>
       </section>
 
-      <section class="game-layer card">
-        <div class="round-row">
-          <div class="team-score team-a">
-            <div class="team-name">萌熊</div>
-            <div class="team-points" id="scoreA">0</div>
-            <div class="team-combo" id="comboA">x1.00</div>
-          </div>
-          <div class="round-center">
-            <div id="roundPhase" class="round-phase">LOBBY</div>
-            <div id="roundRemain" class="round-remain">00.0s</div>
-          </div>
-          <div class="team-score team-b">
-            <div class="team-name">猴子</div>
-            <div class="team-points" id="scoreB">0</div>
-            <div class="team-combo" id="comboB">x1.00</div>
+      <section id="editorView" class="card hidden">
+        <div class="editor-head">
+          <h2>剪辑</h2>
+          <div class="editor-meta">
+            <span id="jobText" class="muted">job: -</span>
+            <button id="backToUpload" class="btn">返回上传</button>
           </div>
         </div>
 
-        <div class="mascot-row">
-          <div class="mascot-card panda">
-            <div class="mascot-head">萌熊状态</div>
-            <div class="mascot-main">
-              <span id="mascotMoodA">focus</span>
-              <span id="mascotEnergyA">50</span>
+        <div class="editor-grid">
+          <div class="preview-card">
+            <div class="preview-toolbar">
+              <button id="addSegmentBtn" class="btn">以当前时间新增片段</button>
+              <label class="switch">
+                <input id="togglePitch" type="checkbox" checked />
+                <span>显示虚拟球场</span>
+              </label>
+            </div>
+            <div class="preview-area">
+              <video id="video" class="video" controls playsinline></video>
+              <canvas id="pitchCanvas" class="pitch-canvas" width="420" height="272"></canvas>
+            </div>
+
+            <div class="timeline-wrap">
+              <div id="timeline" class="timeline"></div>
+              <div class="timeline-hint muted">拖动片段可移动，拖动两端可调整，点击空白处跳转视频时间</div>
             </div>
           </div>
-          <div class="mascot-card monkey">
-            <div class="mascot-head">猴子状态</div>
-            <div class="mascot-main">
-              <span id="mascotMoodB">focus</span>
-              <span id="mascotEnergyB">50</span>
+
+          <div class="side-card">
+            <h3>片段标记</h3>
+            <div id="segmentsList" class="segments-list"></div>
+
+            <h3>导出</h3>
+            <div class="export-row">
+              <label class="field">
+                <span>分辨率</span>
+                <select id="resolution" class="select">
+                  <option value="source">源分辨率</option>
+                  <option value="720p">720p</option>
+                  <option value="1080p">1080p</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>合成虚拟球场</span>
+                <select id="includePitch" class="select">
+                  <option value="0">不合成</option>
+                  <option value="1">合成</option>
+                </select>
+              </label>
             </div>
-          </div>
-        </div>
-
-        <div class="join-row">
-          <button id="joinA" class="join-btn join-a">加入萌熊</button>
-          <button id="joinB" class="join-btn join-b">加入猴子</button>
-          <div id="energyText" class="energy-text">能量 0 / 100</div>
-        </div>
-
-        <div class="action-strip">
-          <div id="windowHint" class="window-hint">窗口提示：等待关键事件</div>
-          <div id="streakText" class="streak-text">连中 0</div>
-        </div>
-
-        <div id="actionGrid" class="actions-grid">
-          <button class="action-card attack" data-action="attack">
-            <span class="action-name">闪电进攻</span>
-            <span class="action-meta">自动择优：射门/传导</span>
-            <span class="action-skill">技能: ShotBuff</span>
-            <span class="action-cost">24</span>
-            <span class="action-cooldown"></span>
-          </button>
-          <button class="action-card defend" data-action="defend">
-            <span class="action-name">铜墙防守</span>
-            <span class="action-meta">自动择优：守门/抢断</span>
-            <span class="action-skill">技能: GoalGuard</span>
-            <span class="action-cost">22</span>
-            <span class="action-cooldown"></span>
-          </button>
-          <button class="action-card hype" data-action="hype">
-            <span class="action-name">狂热连击</span>
-            <span class="action-meta">自动择优：连击/狂热</span>
-            <span class="action-skill">技能: ComboLock</span>
-            <span class="action-cost">26</span>
-            <span class="action-cooldown"></span>
-          </button>
-        </div>
-
-        <div class="event-box">
-          <div class="event-title">实时事件流</div>
-          <div id="eventFeed" class="event-feed"></div>
-        </div>
-      </section>
-
-      <section class="boards">
-        <article class="card">
-          <h2>视频与跟踪框</h2>
-          <div class="video-stack">
-            <video
-              id="sourceVideo"
-              class="source-video"
-              controls
-              muted
-              playsinline
-              autoplay
-              loop
-            ></video>
-            <canvas id="overlay" class="overlay-canvas"></canvas>
-            <div id="videoHint" class="video-hint">加载视频中...</div>
-          </div>
-        </article>
-
-        <article class="card">
-          <h2>萌熊 vs 猴子 自由视角球场</h2>
-          <div class="pitch-viewport" id="pitchViewport">
-            <div class="pitch-scene" id="pitchScene">
-              <canvas id="pitch" width="1050" height="680"></canvas>
+            <div class="export-actions">
+              <button id="saveSegmentsBtn" class="btn">保存片段</button>
+              <button id="exportBtn" class="btn primary">一键导出</button>
             </div>
-            <div class="pitch-help">拖拽旋转视角 · 滚轮缩放 · Shift/右键拖拽平移 · 双击重置</div>
+            <div id="exportStatus" class="muted">未开始导出</div>
+            <a id="downloadLink" class="download-link hidden" href="#" target="_blank" rel="noreferrer">下载导出视频</a>
           </div>
-        </article>
-      </section>
-
-      <section class="meta" id="meta">
-        <span>seq: -</span>
-        <span>entities: -</span>
-        <span>latency: - ms</span>
+        </div>
       </section>
     </main>
-
-    <div id="resultModal" class="result-modal hidden">
-      <div class="result-card">
-        <h3 id="resultTitle">本局结算</h3>
-        <p id="resultSubtitle">-</p>
-        <div id="resultScore" class="result-score">0 : 0</div>
-        <div id="resultMvp" class="result-mvp">MVP: -</div>
-        <button id="resultClose" class="result-close">继续观战</button>
-      </div>
-    </div>
 
     <script src="/static/app.js"></script>
   </body>
